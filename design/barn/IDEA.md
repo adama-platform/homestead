@@ -1,3 +1,136 @@
+# Barn
+A stateless host for WebAssembly, with an iron write path and a cache in front of pond
+------
+
+> Status: a first inference, written to be argued with and tuned. Nothing here is ratified.
+
+## The idea
+
+Goober's host did everything: TLS checks, routing, identity, mail, timers, the bus, approvals, migrations, schemas, generated code, and storage, all behind one manifest. Its boundary tried to give a box typed access to every table it could touch, generated from schemas, which is why the boundary, the checker, and the generator all had to grow together. The parts that held up were the box itself and the entrance to it: an isolated WASM module with no POSIX inheritance, reached over HTTP, SSE, MCP, and email, with routes a person can read and conflicts an operator decides.
+
+Barn is that entrance, and it stays simple in spirit: **barn is a pure evaluator.** Rancher controls every route, and barn only evaluates them. Barn has three jobs:
+
+1. **Route to a box.** Find the one route a request (or a timer event) matches, and pick a box version by the service's traffic policy.
+2. **Enforce the route's rules at runtime.** The permit requirement, the objects, the grant, the limits, and the hold.
+3. **Build the ABI for the box.** Resolve and load the objects, lay out the request, run the box, and turn what it staged into one pond write.
+
+It receives a request, asks permit who the caller is, finds the route, picks a box version, runs the box, and answers. The one boundary that has to be ironclad is the write path, and barn makes it small: **a box is handed the objects its route allows, and for each one it either merges or it doesn't.** Reads are SQL under the route's grant, run by pond. Around those three jobs, barn caches reads (using pond's feed to keep the cache honest), runs timer events from sun, logs every routing decision, counts failures per route, and is the control plane proxy to rancher and permit.
+
+Barn holds no durable state. Any barn can answer any request, so capacity is more barns behind the load balancer, and losing one costs only the requests it was holding.
+
+## Where barn sits
+
+| barn talks to | for | how |
+| --- | --- | --- |
+| Caddy | Requests in, with TLS already done | Plain HTTP. |
+| permit | Who a caller is, and the grants they hold | Verifies tokens locally; follows permit's revocation feed. |
+| rancher | Routes, services, domains, box versions to pull or drop | Subscribes to rancher's config log; fetches modules by hash. |
+| rancher, permit | The control plane API, sign-in, and consent pages | Proxied from the internet to the internal protocol; barn never interprets them. |
+| pond | Reads, writes, queries, names, id ranges, and the feed | `pond_client`, scoped to the request's tenant. |
+| sun | Timer events to run, and one-shot jobs boxes schedule | Subscribes with credit; acknowledges each event. |
+
+Everything but Caddy speaks the internal protocol: multiplexed binary frames over TCP, with optional mutual TLS (see [common](../common.md#the-internal-protocol)).
+
+## A request's life
+
+```
+  client -> Caddy (TLS) -> barn
+                             |
+                     1. resolve the domain to a tenant
+                     2. resolve the caller with permit (!user_id, grants)
+                     3. match the route; check the route's permit requirement
+                     4. pick a box version by the service's policy
+                     5. resolve the route's objects to keys, and load them
+                     6. run the box (iron): it reads objects, queries, and merges or not
+                     7. send its merges to pond as one write (compare-and-set)
+                     8. hold if the route says so, or run the box's "then" export
+                     9. encode the response
+                             |
+  client <- Caddy <- barn <--+
+```
+
+A shadow version gets a copy of the same request; its answer is compared, and its merges are recorded and dropped.
+
+## The iron write path
+
+Iron is the box's write boundary, versioned like `iron@1`. It is deliberately small, because the write path is only a mutation: a set of objects, each of which a box may merge into, or leave alone.
+
+### Two layers of constraint
+
+| layer | where it is set | what it says | when it is checked |
+| --- | --- | --- | --- |
+| The box's write ruleset | Uploaded with the box, in rancher | The buckets this module may ever write, like `["addresses", "profiles", "jobs"]` | At deploy: a route can't give a box an object in a bucket outside its ruleset. |
+| The route's objects | The route, in rancher | Exactly which keys this request may touch, resolved from the request | At runtime, per request: a box can only write the keys barn resolved. |
+
+So a box is constrained at the bucket layer when it is deployed, and per object when it runs. A box that was granted `addresses` can't write a stranger's address, because the route resolved `addresses/{!user_id}` and that is the only address slot it has.
+
+### Objects
+
+A route names its objects as slots, each with a bucket, an id source, and an access:
+
+```json
+"objects": {
+	"address": { "bucket": "addresses", "id": "{!user_id}", "access": "merge" },
+	"profile": { "bucket": "profiles", "id": "{!user_id}", "access": "read" },
+	"customer": { "bucket": "customers", "id": "name:email/{email}", "access": "merge" },
+	"job": { "bucket": "jobs", "id": "new", "access": "merge" }
+}
+```
+
+| id source | resolves to | allowed when |
+| --- | --- | --- |
+| `{!user_id}` and other reserved values | The caller, from permit | Always; the caller can't choose it. |
+| `{param}` | A typed path or query parameter | The route's permit requirement binds that parameter, like `admin/project_{project_id}`, so the caller holds a grant for that very object. |
+| `new` | A fresh id from barn's leased range | Always; written with `if-seq: 0`, so it can only create. |
+| `name:kind/{param}` | The id pond's name service binds to that string | As for `{param}`, and the name is created on first use only if the slot merges. |
+
+| access | the box may |
+| --- | --- |
+| read | Read the object. |
+| merge | Read it, and merge into it or not. |
+| delete | Read it, merge, or delete it. |
+
+### The calls
+
+| import | does |
+| --- | --- |
+| `iron_object_read(slot, ptr, len)` | Copies the object's current document (JSON, or empty if none) into the box's memory. |
+| `iron_object_id(slot, ptr, len)` | The object's id, as a string, so a box can return a new job's id. |
+| `iron_merge(slot, ptr, len)` | Stages a merge patch for the object. Merges to one slot compose in order. |
+| `iron_delete(slot)` | Stages a delete, if the slot allows it. |
+| `iron_hold(table_ptr, len)` | Asks barn not to answer until that table has applied this request's write. |
+
+Everything else a box can do (read the request, respond, query, fetch, log, time, randomness) is the ordinary `barn-abi@1`, and none of it writes.
+
+### What barn does with the merges
+
+When the box returns successfully, barn turns every staged merge and delete into one pond write, with `if-seq` set to the seq each object had when barn loaded it. That gives every box compare-and-set for free:
+
+- **A conflict reruns the box.** If another request changed an object in between, pond refuses the write, and barn loads the objects again and runs the box again, up to a small bound. That is safe because a box is stateless: its write is a function of the request and the objects it was handed.
+- **A failure writes nothing.** A trap, a timeout, or a non-zero return discards every staged merge.
+- **Retries are idempotent.** The pond write carries the request id as its idempotency key.
+
+## Waiting for propagation
+
+Tailers run asynchronously, so a box that wrote may answer before its tables reflect the write. A route or a box can hold back the response instead:
+
+| how | does |
+| --- | --- |
+| `"hold": { "tables": ["users@1"], "timeout-ms": 500 }` on a route | Barn sends the write with a hold, and answers only once pond says those tables applied it. |
+| `iron_hold(table)` in the box | The same, decided by the box at runtime. |
+| A `then` export on the route | After the write is durable and held tables have caught up, barn runs a second export of the same box, which can query fresh tables to render the answer. |
+
+```json
+"route": "POST bobsplumbing.com/jobs",
+"export": "create_job",
+"then": "render_job_list",
+"hold": { "tables": ["jobs@2"], "timeout-ms": 500 }
+```
+
+A hold that times out still answers, with the timeout noted to the box's `then` export and reported as a problem, so a slow tailer shows up as something to fix rather than a hung request.
+
+## Reads
+
 A box reads its objects through iron, and everything else through SQL under the grant its route carries:
 
 ```json
