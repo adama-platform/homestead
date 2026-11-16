@@ -15,7 +15,7 @@ The write path never goes through SQL. Pond owns every write, through MERGE and 
 | caller | when | why |
 | --- | --- | --- |
 | pond | On every query, before it is prepared | The real gate. Barn is trusted infrastructure, but a box wrote the SQL. |
-| rancher | When a route is put, or a table version changes | To tell an operator or agent, at deploy time, that a route's grant names a table, version, or column that doesn't exist, or that dropping a version would break a route. |
+| rancher | When a route is put, or a table version changes | To tell an operator or agent, at deploy time, that a route's grant names a table, version, or column that doesn't exist, that a route's named query is refused, or that dropping a version would break a route. |
 | barn (optional) | Before sending a query to pond | Only as an optimization: refusing early, and keying its cache by the canonical query. Never as the gate. |
 
 ## A permission set
@@ -44,9 +44,13 @@ A permission set (a grant) is the list of tables, versions, and columns a box ma
 | functions | The functions a query may call, from a fixed list fork knows to be pure and cheap. |
 | limits | Caps pond enforces when it runs the query: rows returned, time spent, and the size of the query itself. |
 
+## Table definitions
+
+Fork checks a query against the grant and against the table's real definition: the columns the tailer defines, with their types. The grant says what a box may read; the definition catches a column that was granted but doesn't exist, a typo, and a comparison between incompatible types. Rancher has both at deploy time, and pond has both at query time, so fork runs with both in each place.
+
 ## What fork accepts
 
-A single statement, from a SELECT subset of SQLite's dialect:
+A single statement, from a SELECT subset written in a common dialect: the SQL that SQLite, PostgreSQL, and MySQL all read the same way. Fork accepts only what is portable, and prints canonical SQL that it can render for each, so a table that someday moves to a bigger database keeps its queries. SQLite is the only target today.
 
 - `SELECT` with named columns, expressions, aliases, and `DISTINCT`.
 - `FROM` with tables, inner and left joins, and subqueries.
@@ -54,7 +58,7 @@ A single statement, from a SELECT subset of SQLite's dialect:
 - `WITH` for non-recursive common table expressions.
 - Bound parameters only, written `:name` or `?`. Reserved parameters, like `:!user_id` and `:!tenant`, are filled by barn and can't be bound by a box.
 
-Everything else is refused: every statement but SELECT, `PRAGMA`, `ATTACH`, recursive CTEs, window functions to start, any function not in the grant, any table or column not in the grant, `*` (because it would read columns that weren't granted), and any literal string over a size limit.
+Everything else is refused: every statement but SELECT, `PRAGMA`, `ATTACH`, recursive CTEs, window functions, JSON functions, syntax only one engine understands, any function not in the grant, any table or column not in the grant, `*` (because it would read columns that weren't granted), and any literal string over a size limit.
 
 ## The verdict
 
@@ -96,6 +100,12 @@ SELECT c.name FROM (SELECT id, name FROM customers WHERE owner_id = :!user_id) A
 
 Scopes may only use reserved parameters and literals, since a scope that took a box's parameter would be a filter the box controls.
 
+Grants are row-centric: a scope decides which rows, and the column list decides which columns, and that is the whole model. There is no column masking or aggregate-only access. When data needs different isolation (a public view of a profile beside a private one), a tailer splits it into a separate table with only the columns that audience may see, and a route grants that table.
+
+## Named queries
+
+A route can register its queries by name (see [pond](../pond/IDEA.md#named-queries)). Rancher runs each through fork when the route is put, and stores the verdict's canonical SQL with the route, so a named query is checked once, prepared once by pond, and run by name with parameters. A named query whose table version changes is checked again; one that no longer passes blocks the change. Ad-hoc SQL is still checked on every call.
+
 ## Two locks
 
 Fork is the first lock. Pond still runs every query with the second:
@@ -116,15 +126,13 @@ If fork has a bug, SQLite's own view of the statement still has to agree before 
 | fork_check | Tree and grant to verdict: names, functions, scopes, limits. |
 | fork_print | Tree to canonical SQL. |
 
-Fork depends only on `common_*`. It is a pure function from text and a grant to a verdict, and its tests are tables of queries with the verdict each must get, including a corpus of known SQL injection and confusion tricks.
+Fork depends only on `common_*`. It is a pure function from text and a grant to a verdict.
 
-## Open questions
+The parser is hand-written: recursive descent over the accepted subset, easy to read and strict by construction. Its tests are gold-plated, because fork is a security boundary: tables of queries with the verdict and canonical SQL each must get, every refusal rule exercised, a corpus of known SQL injection and confusion tricks, and round trips (parse, print, parse) that must be stable.
 
-1. **Which parser?** A hand-written recursive-descent parser for a small subset is easy to read and easy to make strict. SQLite's Lemon grammar is complete but describes far more than fork wants. Hand-written, with SQLite's grammar as the reference, is the lean.
-2. **Does fork need the table definitions?** Checking against the grant alone catches what a box may read. Checking against the tailer's actual columns catches typos and types too. Rancher has both at deploy time; pond has both at query time.
-3. **Should grants be expressible per row and per column with types?** Scopes cover the common "only my rows" case. Masking a column, or exposing an aggregate but not the rows under it, is a richer model.
-4. **Window functions and JSON functions?** Both are useful and both are large. They wait until a real box needs them.
-5. **Prepared, named queries?** A box could register its queries at deploy time, so rancher checks them once and pond prepares them once. Ad-hoc SQL stays available for agents.
+## Later
+
+Window functions and JSON functions are useful and large, and they wait for a real need.
 
 ## The invariants
 
@@ -134,4 +142,6 @@ Fork depends only on `common_*`. It is a pure function from text and a grant to 
 - **SQLite only sees fork's output.** The text a box wrote never runs.
 - **Scopes can't be escaped.** Every reference to a scoped table carries its filter.
 - **Reserved parameters come from barn.** A box can't bind `!user_id` or `!tenant`.
+- **Checked against grant and definition.** A granted column must also exist in the table version, with a compatible type.
+- **Portable SQL only.** What fork accepts reads the same in SQLite, PostgreSQL, and MySQL.
 - **Two locks.** Fork's check, then SQLite's authorizer on a read-only connection.

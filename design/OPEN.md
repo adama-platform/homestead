@@ -5,101 +5,11 @@ Every undecided question across the homestead design, in one place
 > Status: collected 2026-11-11 from the open questions in every design doc. Questions that
 > appeared in more than one doc are merged, and each lists its sources. Write your answer
 > under **Answer:**. Once answered, the decision moves into the source docs and the question
-> leaves this file.
+> leaves this file. 2026-11-13: the first round of answers moved into the source docs.
 
 Each question has a **lean**: what the docs currently assume if nobody answers. Leaving an answer empty means "go with the lean for now."
 
-## 0. Terms
-
-### Q0.1 What is the iron ABI?
-*Source:* barn/IDEA.md. "Iron" doesn't appear anywhere in goober's design. The docs assume `iron@1` is a new, small, versioned boundary for the write path only: the route resolves object slots, and for each one the box reads it and then either merges, deletes (if allowed), or does nothing. Reads and everything else are the ordinary `barn-abi@1`.
-*Lean:* as described.
-
-**Answer:**
-
-## 1. Engineering
-
-### Q1.1 `hs::` or `homestead::`?
-*Source:* common.md. The short one reads better in code; the long one can't collide with anything.
-*Lean:* `hs::`.
-
-**Answer:**
-
-### Q1.2 One repository build, or one per service?
-*Source:* common.md.
-*Lean:* one CMake tree with every package, while nothing is deployed separately.
-
-**Answer:**
-
-### Q1.3 Which payload encoding for the internal protocol?
-*Source:* common.md. FlatBuffers reads without copying and evolves by adding fields; Protocol Buffers is the most familiar; a hand-written codec avoids a dependency and a generator.
-*Lean:* FlatBuffers, with our own framing and multiplexing on Asio.
-
-**Answer:**
-
-### Q1.4 Without TLS, is the handshake's service name enough?
-*Source:* common.md. A shared secret per deployment would stop two environments from being wired together by accident, at the cost of one more setting.
-*Lean:* service name only.
-
-**Answer:**
-
-### Q1.5 Component model (WIT) or a hand-written ABI?
-*Source:* barn/IDEA.md. WIT gives bindings in many languages for free; iron is small enough to write by hand in C or WAT.
-*Lean:* hand-written C header for `barn-abi@1` and `iron@1`, WIT later if languages demand it.
-
-**Answer:**
-
-## 2. Tenants and identity
-
-### Q2.1 Is a tenant always a business?
-*Source:* common/TENANT.md. One business running two products may want two tenants with one owner, which needs an owner identity above the tenant.
-*Lean:* a tenant is a realm and a database; ownership across tenants waits.
-
-**Answer:**
-
-### Q2.2 Permit: one database, or one file per realm?
-*Sources:* common/TENANT.md, permit/IDEA.md. One file keyed by realm is simple. A file per realm matches pond's "one tenant, one database," so deleting a tenant is deleting two files.
-*Lean:* one database.
-
-**Answer:**
-
-### Q2.3 How large can one tenant get?
-*Source:* common/TENANT.md. One file is simple until a tenant needs more than one machine's disk or write rate.
-*Lean:* the tenant is the cluster's unit; very large tenants are a problem to meet when one arrives.
-
-**Answer:**
-
-### Q2.4 What does deletion promise?
-*Sources:* common/TENANT.md, pond/IDEA.md (forgetting names). A WAL, backups, and `_names` remember what a deleted tenant or user forgot. Crypto-shredding with a per-tenant key makes tenant deletion final everywhere; replacing a forgotten name's string with a hash keeps its id stable and drops the data.
-*Lean:* both, later.
-
-**Answer:**
-
-### Q2.5 Long lists of grants
-*Source:* permit/IDEA.md. A user who edits ten thousand projects shouldn't make every request load ten thousand strings.
-*Lean:* check a requirement against permit's index for the bound parameter, not the whole list.
-
-**Answer:**
-
-### Q2.6 Who sends mail?
-*Source:* permit/IDEA.md. Email sign-in codes need a sender before homestead has a mail design.
-*Lean:* a per-tenant provider configured in rancher, called by permit directly.
-
-**Answer:**
-
-### Q2.7 Operator sign-in
-*Source:* permit/IDEA.md. Goober let host operators sign in on any domain and drop into a tenant.
-*Lean:* keep it, and design audit and consent before building it.
-
-**Answer:**
-
 ## 3. Data (pond and fork)
-
-### Q3.1 Which merges?
-*Source:* pond/IDEA.md. Is RFC 7386 enough to start, or do counters, sets, and lists need to come first so two writers adding to one list don't lose each other's work?
-*Lean:* RFC 7386 first.
-
-**Answer:**
 
 ### Q3.2 How long is history kept?
 *Source:* pond/IDEA.md. The WAL is truncated once applied, and `_changes` is kept for a window. Keeping every write forever, as WAL segments in object storage, is valuable and is also a privacy problem.
@@ -107,162 +17,123 @@ Each question has a **lean**: what the docs currently assume if nobody answers. 
 
 **Answer:**
 
-### Q3.3 What else can a tailer do?
-*Source:* pond/IDEA.md. Exploding an array into child rows (a job's line items) is the obvious next shape after one row per id, and after joins of several buckets by id.
-*Lean:* wait for a real need.
+
+## 9. Store
+
+### Q9.1 Does the `.shtml` name stay?
+*Source:* store/IDEA.md. It is historical and agents know it; a `.html` page with `stitch: true` in its front matter would avoid a new extension.
+*Lean:* `.shtml`.
 
 **Answer:**
 
-### Q3.4 Does the feed filter by key?
-*Source:* pond/IDEA.md. Subscribing to one id would let barn's SSE clients watch one entity without a bucket's whole feed.
-*Lean:* buckets only to start.
+### Q9.2 Directives in a box's own HTML?
+*Source:* store/IDEA.md. Goober let a box opt in with `"includes": true`.
+*Lean:* components only, no live includes, so a box can't widen its reads through a page.
 
 **Answer:**
 
-### Q3.5 Backups
-*Source:* pond/IDEA.md. Tenant snapshots plus the WAL tail, shipped continuously (like Litestream) or nightly.
-*Lean:* nightly snapshots plus continuous WAL shipping.
+### Q9.3 Can a component include one component?
+*Source:* store/IDEA.md. Two levels would let a `card-grid` use `card`, at the cost of loop checks.
+*Lean:* one level only.
 
 **Answer:**
 
-### Q3.6 Which SQL parser?
-*Source:* fork/IDEA.md. A hand-written recursive-descent parser for a small subset is easy to read and strict; SQLite's Lemon grammar is complete but describes far more than fork wants.
-*Lean:* hand-written, with SQLite's grammar as the reference.
+### Q9.4 A/B by page, or only by release?
+*Source:* store/IDEA.md. A split on one page would let an agent test a headline without forking the site.
+*Lean:* by release only.
 
 **Answer:**
 
-### Q3.7 Does fork check against table definitions?
-*Source:* fork/IDEA.md. The grant alone says what a box may read; the table's real columns also catch typos and types.
-*Lean:* yes, in both rancher (at deploy) and pond (at query time).
+### Q9.5 Are route includes shared unless marked per-viewer?
+*Source:* store/IDEA.md. Mirrors the SSE fan-out rule.
+*Lean:* yes.
 
 **Answer:**
 
-### Q3.8 Richer grants
-*Source:* fork/IDEA.md. Scopes cover "only my rows." Masking a column, or exposing an aggregate but not the rows under it, is a richer model.
-*Lean:* scopes only.
+### Q9.6 Where do attachment bytes live?
+*Source:* store/IDEA.md. Store's own blob directory now; pond may grow object storage for uploads later, and the two could share it.
+*Lean:* store's blob directory.
 
 **Answer:**
 
-### Q3.9 Window and JSON functions in SQL?
-*Source:* fork/IDEA.md.
-*Lean:* wait until a real box needs them.
+### Q9.7 Is the built-in kit pinned per release?
+*Source:* store/IDEA.md. The kit and built-in components are host code; pinning by hash means an upgrade never changes a deployed page.
+*Lean:* yes, pinned by hash.
 
 **Answer:**
 
-### Q3.10 Prepared, named queries?
-*Source:* fork/IDEA.md. A route could register its queries at deploy, so rancher checks them once and pond prepares them once. Ad-hoc SQL stays available for agents.
-*Lean:* later, as an optimization.
+## 10. Mail (barker)
+
+### Q10.1 Who renders mail?
+*Source:* barker/IDEA.md. Barn rendering at the call catches errors early; barker rendering at send keeps barn smaller.
+*Lean:* render in both, against one template version.
 
 **Answer:**
 
-## 4. Barn
-
-### Q4.1 Objects a route can't know in advance
-*Source:* barn/IDEA.md. A box writing a variable number of line items needs `new*` slots, or a slot over child ids listed in a parent object. Both widen iron.
-*Lean:* wait for a real box.
+### Q10.2 Platform fallback for auth mail
+*Source:* barker/IDEA.md. Sending a business's sign-in codes from the platform's domain is reliable but looks like someone else's mail.
+*Lean:* fall back to the platform domain only while the tenant's domain is unverified.
 
 **Answer:**
 
-### Q4.2 How many reruns on a compare-and-set conflict?
-*Source:* barn/IDEA.md.
-*Lean:* a small bound (3), with repeated conflicts reported as a problem.
+### Q10.3 Bulk mail at all?
+*Source:* barker/IDEA.md. Goober grew categories and lists for outreach.
+*Lean:* refuse bulk until a real product needs it.
 
 **Answer:**
 
-### Q4.3 Where do routing logs go?
-*Source:* barn/IDEA.md. Local files shipped to object storage are cheap; a log service agents can query is more useful.
-*Lean:* every failure plus a sample of successes, shipped to object storage, with recent records queryable through rancher.
+### Q10.4 DKIM keys: barker's or the provider's?
+*Source:* barker/IDEA.md. Holding them makes switching providers seamless; SES Easy DKIM is less to run.
+*Lean:* undecided.
 
 **Answer:**
 
-### Q4.4 How does SSE fan out?
-*Source:* barn/IDEA.md. A thousand clients watching one bucket shouldn't run a box a thousand times per change.
-*Lean:* run the export once per change per distinct set of subscription parameters.
+### Q10.5 Templates per language
+*Source:* barker/IDEA.md.
+*Lean:* wait for real need.
 
 **Answer:**
 
-### Q4.5 Is `reset` isolation practical?
-*Source:* barn/IDEA.md. It depends on how well wasmtime restores linear memory from a snapshot.
-*Lean:* `fresh` is the default until `reset` is measured.
+### Q10.6 Bodies in the outbox?
+*Source:* barker/IDEA.md. Template, vars, and version are smaller and keep personal text out of pond's history.
+*Lean:* template, vars, and version only.
 
 **Answer:**
 
-## 5. Control (rancher)
+## 11. Logs (ranger)
 
-### Q5.1 Does rancher's state belong in pond?
-*Source:* rancher/IDEA.md. A reserved `_rancher` tenant gives a WAL, a feed, and backups for free, and couples the control plane to the data plane's health.
-*Lean:* rancher's own SQLite.
-
-**Answer:**
-
-### Q5.2 Automatic rollback?
-*Source:* rancher/IDEA.md.
-*Lean:* guardrails stop a ramp and raise a problem; a person or agent rolls back.
+### Q11.1 Box logs
+*Source:* ranger/IDEA.md. A box's own log text is tenant-authored and can carry personal data, which breaks "never tenant data."
+*Lean:* a separate, shorter-lived stream with its own scope.
 
 **Answer:**
 
-### Q5.3 Who may change what?
-*Source:* rancher/IDEA.md. Approvals for operators and agents: which changes, especially widenings of a box's `writes`, a route's objects, and grants, need a person.
-*Lean:* widenings wait for a person; everything else goes.
+### Q11.2 Sampling routing records
+*Source:* ranger/IDEA.md.
+*Lean:* one line per request; every failure plus a sample of successes if disk demands it.
 
 **Answer:**
 
-### Q5.4 Routes per tenant, or per domain pattern?
-*Source:* rancher/IDEA.md. A product serving many tenants wants one route on `*`, with the tenant from the domain; a single business wants routes on its own domain.
-*Lean:* both, with the specific domain winning over `*`.
+### Q11.3 Indexing
+*Source:* ranger/IDEA.md. A full-text index makes grep fast and ranger much larger.
+*Lean:* four indexed fields and bounded scans.
 
 **Answer:**
 
-## 6. Timers (sun)
-
-### Q6.1 Who may schedule what, and what can a payload bind?
-*Sources:* rancher/IDEA.md, sun/IDEA.md. A route's `schedules` list lets its box schedule timer routes, and a timer route can resolve objects from payload fields (`{payload.job_id}`), so it trusts whatever route scheduled the job.
-*Lean:* allowed, and rancher shows the whole chain ("PUT /jobs can schedule send_reminder, which merges into jobs") as one widening.
+### Q11.4 Searching archives
+*Source:* ranger/IDEA.md.
+*Lean:* restore a sealed day to search it.
 
 **Answer:**
 
-### Q6.2 Long jobs
-*Source:* sun/IDEA.md. A box runs for seconds; the 30-minute lease covers queueing and retries.
-*Lean:* a job that needs longer schedules its own continuation.
+### Q11.5 A cluster of rangers
+*Source:* ranger/IDEA.md.
+*Lean:* partition by tenant, like pond, when one machine isn't enough.
 
 **Answer:**
 
-### Q6.3 Time zones and daylight saving
-*Source:* sun/IDEA.md. A recurring schedule in a zone needs a rule for the hour that happens twice and the hour that doesn't happen.
-*Lean:* fire once in a repeated hour, and at the next valid time for a skipped one.
-
-**Answer:**
-
-### Q6.4 A cluster of suns
-*Source:* sun/IDEA.md.
-*Lean:* partition jobs by tenant, like pond, when one machine isn't enough.
-
-**Answer:**
-
-## 7. Effects across services
-
-### Q7.1 Writes, grants, and schedules in one request
-*Sources:* permit/IDEA.md, sun/IDEA.md. A request can write to pond, grant a role in permit, and schedule a job in sun: three services, no transaction.
-*Lean:* barn applies grants and schedules only after the pond write lands, each idempotent by request id. If "exists if and only if the write landed" becomes necessary, pond holds an outbox that permit and sun drain.
-
-**Answer:**
-
-## 8. Problems
-
-### Q8.1 Does a tenant see its own problems?
-*Source:* common/PROBLEMS.md. A business's owner or agent would benefit, and problems must not reveal the platform's internals.
-*Lean:* not yet.
-
-**Answer:**
-
-### Q8.2 Do problems ever act?
-*Source:* common/PROBLEMS.md.
-*Lean:* only report; acting is a person's or agent's decision.
-
-**Answer:**
-
-### Q8.3 How long are problems kept?
-*Source:* common/PROBLEMS.md.
-*Lean:* resolved problems are compacted to counts after 30 days.
+### Q11.6 Chain across hosts
+*Source:* ranger/IDEA.md.
+*Lean:* chains per stream per host.
 
 **Answer:**

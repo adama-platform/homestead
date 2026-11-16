@@ -47,7 +47,7 @@ A failure an agent can't see is a failure nobody fixes. So every service elevate
 | --- | --- |
 | pond | A field of the wrong type for a table; a tailer falling behind; a hold or wait timing out; a write refused for a stale `if-seq` or a dead key. |
 | fork | A query naming a table, version, column, or function its grant doesn't have; SQL outside the accepted subset. |
-| barn | A trap, a fuel, memory, or deadline limit; a merge to a read-only slot; compare-and-set that kept conflicting; a fetch to an undeclared address. |
+| barn | A trap, a fuel, memory, or deadline limit; a merge to a read-only slot; a compare-and-set conflict on a hot object; a fetch to an undeclared address. |
 | permit | A requirement nobody can satisfy; a parameter an object uses that the requirement doesn't bind. |
 | rancher | A route that would give a box a write outside its ruleset; a guardrail breached during a ramp. |
 
@@ -59,18 +59,18 @@ A failure an agent can't see is a failure nobody fixes. So every service elevate
 4. **Act.** A problem names what caused it, so the agent that owns the box version can read the problem, change the code or put a new table version, try it, and ship it.
 5. **Resolve.** A problem is resolved by a person or agent, or automatically when the version that caused it is no longer live and it stops happening.
 
+## Keeping problems
+
+Open problems are kept as long as they are open. A resolved problem keeps its examples for 30 days, long enough to compare the version that caused it with the one that fixed it, and is then compacted to its counts, first and last seen, and the versions involved.
+
 ## Rules
 
 - **Shapes, not values.** A problem never carries a document's data, a query's parameters, or a request body. It carries ids, seqs, request ids, and types. An operator can look up the rest with the access that requires.
 - **Problems are bounded.** Every service caps the fingerprints it tracks, and over the cap, reports one problem saying so.
 - **Every refusal is a problem.** If a service refuses something at runtime that a deploy-time check could have caught, it is reported, so the check can be added.
+- **Problems only report.** A problem never acts on its own: it doesn't slow a route, roll back a version, or pause a tailer. Acting is a person's or agent's decision (a ramp's guardrails, which do roll back, are rancher's, not the problem log's).
+- **Problems are for operators and their agents.** Tenants don't see their own problems yet, since a problem can reveal the platform's internals.
 - **The catalog is fixed.** A new kind of problem is a new code with a documented meaning and hint, so agents can learn the catalog.
-
-## Open questions
-
-1. **Does a tenant see its own problems?** A business's owner, or the business's agent, would benefit, and the problems must not reveal the platform's internals.
-2. **Do problems ever act?** A tailer falling behind could raise a ramp guardrail or slow a route; acting is a decision, and the start is only reporting.
-3. **How long are problems kept?** Long enough to compare versions; resolved problems could be compacted to counts.
 
 ## The invariants
 

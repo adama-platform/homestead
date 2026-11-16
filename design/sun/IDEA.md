@@ -15,14 +15,14 @@ Sun knows tenants, timer route names, times, and payloads. It doesn't know boxes
 ## The shape
 
 ```
-   rancher ---- recurring schedules ----+
-                                        v
-   barn ---- one-shot jobs (from boxes) --> +--------------------+
-                                            | sun (one machine)  |
-                                            |  jobs by due time  |
-                                            |  leases, attempts  |
-                                            |  dead letter box   |
-                                            +--------------------+
+   rancher ---- system timers (recurring) ---+
+                                             v
+   barn ---- scheduled jobs (pond outbox) --> +------------------+
+                                              | sun (one machine)|
+                                              |  jobs by due time|
+                                              |  leases, attempts|
+                                              |  dead letter box |
+                                              +------------------+
                                                  |  fire (with credit)
                        +-------------------------+------------------------+
                        v                         v                        v
@@ -58,12 +58,18 @@ Sun knows tenants, timer route names, times, and payloads. It doesn't know boxes
 
 ## Registering jobs
 
-| from | how | for |
-| --- | --- | --- |
-| A box | A route lists the timer routes it may schedule (`"schedules": ["timer:send_reminder"]`). The box asks barn to schedule or cancel, by key; barn sends the request to sun once the request's pond write has landed. | One-shot jobs that follow from data: a reminder, a retry of an outbound call, an expiry. |
-| Rancher | A recurring schedule on a timer route, like `"every": "1d", "at": "03:00", "zone": "America/Los_Angeles"`, for one tenant or every tenant that has the route. | Sweeps, reports, digests. |
+A timer is a temporal route, and it comes in two forms:
 
-A recurring schedule is not a job; sun creates each occurrence as a job when it comes due. A schedule over every tenant is spread with jitter across a window, so a nightly sweep for a thousand tenants is a thousand jobs over minutes, not a thousand at once.
+| form | from | how | runs for | for |
+| --- | --- | --- | --- | --- |
+| Scheduled job | A box | A route lists the timer routes it may schedule (`"schedules": ["timer:send_reminder"]`). The box asks to schedule or cancel, by key; the request is an effect in pond's outbox, committed with the request's write, and a barn delivers it to sun. So a job exists if and only if the write that scheduled it landed. | Seconds, like any request. | One-shot jobs that follow from data: a reminder, a retry of an outbound call, an expiry. |
+| System timer | Rancher | A recurring schedule on a timer route, like `"every": "1d", "at": "03:00", "zone": "America/Los_Angeles"`, for the tenant that has the route. | As long as it needs: minutes or hours. | Sweeps, reports, digests, maintenance. |
+
+A timer route's objects may bind payload fields (`{payload.job_id}`), so it trusts the routes that may schedule it. Rancher shows that chain as one widening when a route's `schedules` list grows.
+
+A recurring schedule is not a job; sun creates each occurrence as a job when it comes due. Many tenants' schedules at the same hour are spread with jitter across a window, so a thousand nightly sweeps are a thousand jobs over minutes, not a thousand at once.
+
+**Daylight saving.** A schedule in a zone fires once per occurrence, whatever the clock does: in an hour that happens twice, it fires the first time only; for an hour that doesn't happen, it fires once at the next valid time. Either way sun writes a log record (to [ranger](../ranger/IDEA.md)) saying which occurrence was shifted or collapsed and why.
 
 ## Delivery
 
@@ -75,11 +81,15 @@ Barns subscribe to sun over the internal protocol, each saying how many timer ev
 4. **Expire.** A job not acknowledged by `lease-until` is due again, and sun prefers a different barn. A barn whose connection drops has its leases released at once, rather than waiting the full lease.
 5. **Dead letter.** A job whose attempts reach `max-attempts` without `done` moves to the dead letter box.
 
+**Long system jobs.** A scheduled job runs in seconds, and its lease covers queueing and retries. A system job may run for much longer, so barn renews its lease with a heartbeat while it runs: the lease stays at most 30 minutes, so a barn that dies is noticed within one lease, but a healthy barn can keep a system job for as long as its schedule's deadline allows.
+
 Delivery is at least once, and effects are at most once per job: every attempt writes to pond with the job's id as the idempotency key, so a retry after a lost acknowledgment can't apply its writes twice.
 
 | setting | default | maximum |
 | --- | --- | --- |
-| lease | 30 minutes | 30 minutes |
+| lease | 30 minutes | 30 minutes, renewable by heartbeat for system jobs |
+| scheduled job deadline | seconds, as the route's limits | the route's limits |
+| system job deadline | 1 hour | set per schedule |
 | attempts | 5 | 20 |
 | backoff | 30 seconds, doubling | 1 hour between attempts |
 
@@ -103,7 +113,11 @@ Sun counts, per tenant and timer route: jobs scheduled, fired, done, failed, exp
 
 ## Storage
 
-Sun keeps its own SQLite database: pending jobs indexed by due time, leased jobs indexed by `lease-until`, recurring schedules, and the dead letter box. A job is durable before sun acknowledges scheduling it. In memory, sun holds the next window of due jobs in a timer wheel, refilled from the index, so a million future jobs cost disk, not memory. Sun's clock is injected, so tests run time by hand.
+Sun keeps its own SQLite database: pending jobs indexed by due time, deduplicated by the outbox element's idempotency key, leased jobs indexed by `lease-until`, recurring schedules, and the dead letter box. A job is durable before sun acknowledges scheduling it. In memory, sun holds the next window of due jobs in a timer wheel, refilled from the index, so a million future jobs cost disk, not memory. Sun's clock is injected, so tests run time by hand.
+
+## Scale
+
+Sun is one machine, and stays one machine. Tenants are bound to a single machine everywhere except barn's compute, and sun's work (jobs indexed by due time) is small next to pond's. If sun ever needs to split, it splits by tenant, like pond.
 
 ## What sun is not
 
@@ -112,19 +126,13 @@ Sun keeps its own SQLite database: pending jobs indexed by due time, leased jobs
 - **Not precise to the millisecond.** Jobs fire no earlier than due, typically within a second after.
 - **Not aware of boxes.** It knows route names; rancher and barn know the rest.
 
-## Open questions
-
-1. **Scheduling and writing together.** A box that writes and schedules does two things in two services. Barn scheduling only after the pond write lands, keyed for idempotency, is the start; a job that must exist if and only if a write landed may want pond to hold an outbox that sun drains.
-2. **Which objects can a payload bind?** A timer route resolving `{payload.job_id}` trusts whatever route scheduled the job. Rancher should show that chain ("PUT /jobs can schedule send_reminder, which merges into jobs") as one widening.
-3. **Long jobs.** A box runs for seconds; the 30-minute lease covers queueing and retries in barn. A job that truly needs longer is a job that schedules its own continuation.
-4. **Time zones and daylight saving.** Recurring schedules in a zone need a rule for the hour that happens twice and the hour that doesn't happen.
-5. **A cluster of suns.** Partitioning jobs by tenant, like pond, is the obvious path once one machine isn't enough.
-
 ## The invariants
 
 - **A job fires no earlier than due.**
+- **A scheduled job exists if and only if the write that scheduled it landed.** It arrives through pond's outbox.
 - **A job is leased to one barn at a time, for at most 30 minutes.** No acknowledgment means another barn gets it.
 - **Delivery is at least once; effects are at most once.** Every attempt writes with the job's id as its idempotency key.
+- **Each occurrence fires once.** A daylight saving shift never doubles or drops a fire, and is logged.
 - **Too many failures means the dead letter box.** Never silent loss, never endless retries.
 - **Every dead job is a problem.** Counted per route.
 - **Sun never chooses a tenant.** Barn or rancher sets it, and a box never can.

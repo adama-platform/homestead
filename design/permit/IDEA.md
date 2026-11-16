@@ -28,14 +28,14 @@ Profile data (names, avatars, addresses) is not permit's. It lives in pond bucke
 
 ## Storage
 
-Permit keeps its own SQLite database, apart from pond, so identity can be backed up, audited, and secured on its own. Every row is keyed by realm, so one realm can be exported, moved, or deleted along with its tenant. Permit leases id ranges from pond for user ids, so a user's id is unique everywhere and is a natural key in every bucket.
+Permit keeps one SQLite database for every realm, apart from pond, so identity can be backed up, audited, and secured on its own. Every row is keyed by realm, so one realm can be exported, moved, or deleted along with its tenant. Every row about a user is keyed by their id too, so deleting a user (see [tenants](../common/TENANT.md#deletion)) removes their credentials, sessions, grants, and tokens; the audit keeps that the deletion happened. Permit leases id ranges from pond for user ids, so a user's id is unique everywhere and is a natural key in every bucket.
 
 ## Authentication
 
 | method | for |
 | --- | --- |
 | Passkeys (WebAuthn) | The default for people. Bound to the realm's domain by the browser. |
-| Email codes or links | Bootstrapping, recovery, and people without passkeys. Mail is sent through the tenant's sender. |
+| Email codes or links | Bootstrapping, recovery, and people without passkeys. Mail is sent by [barker](../barker/IDEA.md), homestead's one mail sender, with the tenant's sending identity. |
 | External OIDC | "Sign in with Google" and similar, per realm, with the provider's subject as a credential. |
 | OAuth 2.1 as a server | Agents over MCP: authorization code with PKCE, a consent screen naming the domain and the grants asked for. |
 
@@ -64,6 +64,9 @@ A token is a signed statement permit makes, which barn can verify without callin
 | invite | Grants to attach to whoever redeems it | "Join project 42 as editor." |
 | operator | A `host:` role, valid on any domain, satisfying only host requirements | Support staff, audited per tenant reached. |
 
+**Operators sign in anywhere.** As in goober, a host operator can sign in on any tenant's domain (usually `ops.example.com`) and drop into that tenant. Their token carries only `host:` roles, so it satisfies only host requirements, never a tenant's own grants, and every tenant an operator enters is recorded in the audit with who, when, and from where.
+
+- **Grant lists are short.** Homestead isn't that granular: a user holds fewer than 50 grants at p100, and permit refuses more than 250 per subject. So a token or a cached grant list is small, and checking a requirement is a scan of a short list, not an index lookup.
 - **Grants are strings.** `owner`, `admin`, `editor/project_42`. The `/` scopes a role to something inside the realm, prefixed by kind so `project_42` and `workspace_42` never collide. `:` is reserved for `host:` roles, and `_` for system roles like `_signed_in`, which every user holds.
 - **Access tokens are short-lived**, and refreshed from a session. Capability and invite tokens can be long-lived, and every token has an id permit can revoke.
 - **Barn verifies tokens locally** with permit's public keys, and caches each user's live grants. Permit publishes a feed of revocations and grant changes, like pond's feed, and barn drops what it changed.
@@ -90,21 +93,13 @@ Products grant and revoke their own roles through routes, so a product's securit
 "gives": ["editor/project_{project_id}", "viewer/project_{project_id}"]
 ```
 
-A box on that route may ask barn to grant or revoke the listed roles, with the route's bound parameters substituted, so an admin of project 42 can hand out roles in project 42 and nowhere else. Barn applies the grants through permit after the box succeeds, alongside its pond write. Minting a capability or invite token for those roles works the same way.
+A box on that route may ask barn to grant or revoke the listed roles, with the route's bound parameters substituted, so an admin of project 42 can hand out roles in project 42 and nowhere else. The grants are committed as effects in pond's outbox, in the same write as the box's merges, and a barn delivers them to permit (see [pond](../pond/IDEA.md#the-outbox)). So a grant exists if and only if the write that gave it landed, and permit deduplicates redeliveries by the element's idempotency key. Minting a capability or invite token for those roles works the same way.
 
 ## What permit is not
 
 - **Not object security.** Which objects and tables a request may touch is routing's job, using permit's answers.
 - **Not a profile store.** User data is documents in pond, keyed by the user's id.
 - **Not in the data path.** Barn verifies tokens locally; permit is called on sign-in, refresh, consent, and grant changes.
-
-## Open questions
-
-1. **One database, or one per realm?** One file keyed by realm is simple. A file per realm matches pond's "one tenant, one database" and makes deleting a realm deleting a file.
-2. **How are grants kept consistent with pond writes?** A route that writes an object and grants a role does two things in two services. Applying the grant only after the pond write succeeds, idempotently by request id, is the start.
-3. **Lists of grants that get long.** A user who is an editor of ten thousand projects shouldn't make every request load ten thousand strings. Checking a requirement against permit's index for the bound parameter, not the whole list, is one answer.
-4. **Who sends mail?** Email codes need a sender before homestead has a mail design of its own.
-5. **Operator sign-in.** Goober let host operators sign in on any domain and drop into a tenant. That remains useful and needs its own design for audit and consent.
 
 ## The invariants
 
@@ -114,4 +109,6 @@ A box on that route may ask barn to grant or revoke the listed roles, with the r
 - **Every token is signed, expiring or revocable, and audited.** Barn can verify it without permit.
 - **An agent never holds more than its subject.**
 - **Only bound parameters choose objects.** A caller addresses only what a grant names.
+- **Grants from a route ride pond's outbox.** A grant exists if and only if its write landed.
+- **Grant lists are short.** At most 250 per subject.
 - **Permit decides who; routing decides what.**

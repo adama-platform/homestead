@@ -16,36 +16,36 @@ Goober's engineering practice held up better than its product design. C++ with a
 | Build | CMake with Ninja, through `CMakePresets.json`; GoogleTest through CTest. | goober |
 | Third-party baseline | Boost (Asio and Beast for HTTP, Boost.JSON for JSON), SQLite 3, GoogleTest. wasmtime through its C++ API, in barn only. | goober |
 | Durable storage | SQLite, in WAL mode, for every service's own state. Pond adds its own write-ahead log in front of SQLite for client writes. | goober, narrowed |
-| Wire | Between services, a multiplexed binary protocol over TCP, with optional mutual TLS. HTTP only at the edge, in barn. See [The internal protocol](#the-internal-protocol). | new; goober's PHILOSOPHY § 7 asked for it |
+| Wire | Between services, a multiplexed binary protocol over TCP, with FlatBuffers payloads and optional mutual TLS. HTTP only at the edge, in barn. See [The internal protocol](#the-internal-protocol). | new; goober's PHILOSOPHY § 7 asked for it |
 | Ids | 64-bit, positive, globally unique, minted from ranges that pond vends, plus names that pond binds to ids. Strings in JSON. See [Ids](#ids). | goober (human/021.PrimaryKeys.md), extended |
 | Failures | Elevated as structured problems an agent can act on, not only logged. See [PROBLEMS.md](common/PROBLEMS.md). | new |
 
 ## Packages
 
-Every package is one directory under `src/`. The underscore in a package name is a namespace, so `pond_wal` is `hs::pond::wal` and builds the static library `hs_pond_wal`. Names are lean.
+Every package is one directory under `src/`. The underscore in a package name is a namespace under `homestead::`, so `pond_wal` is `homestead::pond::wal` and builds the static library `homestead_pond_wal`. The long namespace can't collide with anything, and code inside a package rarely spells it out. Names are lean.
 
 ```
 src/
-  common_core/        hs::common::core      clocks, errors, ids, names
-  common_json/        hs::common::json      thin Boost.JSON helpers, ids as strings
-  common_http/        hs::common::http      server and client on Beast, SSE (barn's edge)
-  common_wire/        hs::common::wire      the internal protocol: frames, streams, flow control
-  common_tls/         hs::common::tls       optional mutual TLS for the wire, host certificates
-  common_sqlite/      hs::common::sqlite    RAII over sqlite3, statements, pragmas
-  fork_ast/           hs::fork::ast         the SQL tree
-  fork_parse/         hs::fork::parse       text -> tree
-  fork_check/         hs::fork::check       tree x permission set -> verdict
-  fork_print/         hs::fork::print       tree -> canonical SQL
-  pond_wal/           hs::pond::wal
-  pond_bucket/        hs::pond::bucket
-  pond_tailer/        hs::pond::tailer
-  pond_query/         hs::pond::query
-  pond_feed/          hs::pond::feed
-  pond_ids/           hs::pond::ids         the counter, ranges, and names
-  pond_client/        hs::pond::client      the only way other services reach pond
-  pond_system/        hs::pond::system      composition root
-  pond_main/                                the binary
-  barn_iron/          hs::barn::iron        the write boundary: objects, merges
+  common_core/        homestead::common::core      clocks, errors, ids, names
+  common_json/        homestead::common::json      thin Boost.JSON helpers, ids as strings
+  common_http/        homestead::common::http      server and client on Beast, SSE (barn's edge)
+  common_wire/        homestead::common::wire      the internal protocol: frames, streams, flow control
+  common_tls/         homestead::common::tls       optional mutual TLS for the wire, host certificates
+  common_sqlite/      homestead::common::sqlite    RAII over sqlite3, statements, pragmas
+  fork_ast/           homestead::fork::ast         the SQL tree
+  fork_parse/         homestead::fork::parse       text -> tree
+  fork_check/         homestead::fork::check       tree x permission set -> verdict
+  fork_print/         homestead::fork::print       tree -> canonical SQL
+  pond_wal/           homestead::pond::wal
+  pond_bucket/        homestead::pond::bucket
+  pond_tailer/        homestead::pond::tailer
+  pond_query/         homestead::pond::query
+  pond_feed/          homestead::pond::feed
+  pond_ids/           homestead::pond::ids         the counter, ranges, and names
+  pond_client/        homestead::pond::client      the only way other services reach pond
+  pond_system/        homestead::pond::system      composition root
+  pond_main/                                       the binary
+  barn_iron/          homestead::barn::iron        the write boundary: objects, merges
   barn_...  rancher_...  permit_...          the same shape
 ```
 
@@ -54,6 +54,12 @@ Each package has:
 - **A `QUALITY.md`** that says what the package promises, how it is tested, and what "good" means for it. `common_http` is a faithful, boring adaptation of HTTP; `fork_check` is a security boundary and is tested like one.
 - **Its own CMake target and tests.** A package lists its dependencies in its `CMakeLists.txt`, and anything not listed can't be included.
 - **One clear responsibility.** Changes land per package, so a pull request is a meaningful change to one or a few packages, never a thousand files.
+
+### Isolation
+
+Every package is isolated, and so is every service. A package builds and tests on its own, from its own target, with only the packages it lists. A service is its own tree of packages, like goober's host was, with its own composition root and binary, and it builds, tests, and deploys without building any other service. A shared top-level CMake tree is only a convenience for building everything at once; nothing depends on it.
+
+Isolation is also what makes deployment smooth. A deploy knows which packages changed, and so which services' binaries changed, and restarts only those. Each service has its own shutdown logic (barn drains requests, sun hands back leases, pond flushes and checkpoints its WAL), and pond, which holds the data, is built to change rarely, so most deploys never restart it.
 
 ### Dependency direction
 
@@ -109,6 +115,9 @@ Every object any service keys by an id gets one from a single counter that pond 
 | permit | One machine | Identity, authentication, and grants per tenant, in its own database |
 | barn | Horizontal and stateless | Nothing durable; caches only |
 | sun | One machine | Temporal jobs, their leases, and the dead letter box |
+| barker | One machine | Sending every email, for every service (see [barker](barker/IDEA.md)) |
+| ranger | One machine | Logs from every service, searchable in real time (see [ranger](ranger/IDEA.md)) |
+| store | One machine | Each tenant's site: pages, layouts, components, named queries, attachments, and immutable releases (see [store](store/IDEA.md)) |
 
 Only barn is reachable from the internet, behind Caddy, which does TLS. Every other connection is the internal protocol.
 
@@ -122,7 +131,7 @@ Services talk to each other constantly: every request is a permit check, an obje
 | Frames | Length-prefixed: a stream id, a frame type (open, data, close, error, credit, ping), flags, and a payload. |
 | Streams | Many concurrent streams per connection, so one slow query never blocks another call. A stream is a single call (request and response) or a long-lived subscription (a feed, timer events). |
 | Flow control | Credit per stream and per connection, so a slow consumer slows its own stream, never the connection. Sun's timer credit is the same mechanism. |
-| Payloads | A compact binary encoding, from one schema per service in the repo, with documents (JSON) carried as opaque bytes inside. Fields are numbered and only ever added, so old and new peers interoperate. |
+| Payloads | FlatBuffers, from one schema per service in the repo, read without copying, with documents (JSON) carried as opaque bytes inside. Fields are only ever added, so old and new peers interoperate. Framing and multiplexing are our own, on Asio. |
 | Calls | Every call has a deadline, carried with it, and an idempotency key where it changes state. |
 | Pipelining | Writes are batched per connection, and pond can group commit them; a barn sends many tenants' writes on one connection. |
 
@@ -147,17 +156,10 @@ On one machine, or a private network, the internal protocol can run in plaintext
 ```
 
 - **With `tls`,** every connection is mutual TLS. A peer is accepted only if its certificate chains to the configured CA, and the certificate names the peer's service (like `barn` or `rancher`), which decides what it may call: only rancher may call pond's, permit's, and sun's control APIs.
-- **Without `tls`,** the same service names are sent in the handshake and the same call rules are checked, but nothing is proven. That is for one machine or a network you trust.
+- **Without `tls`,** the same service names are sent in the handshake and the same call rules are checked, but nothing is proven. That is for one machine or a network you trust. For now the service name is the whole handshake, with no shared secret per deployment; TLS is the planned answer to wiring two environments together by accident.
 - **`require`** refuses plaintext peers, so a cluster can be moved to TLS one host at a time and then locked.
 - **Certificates are reloaded** on SIGHUP, like the rest of the config, so rotation needs no restart.
 
 ## Docs
 
 Design docs live in `design/$service/`, and each starts as an IDEA.md: a title, a one-line subtitle, a status line, the idea, then tables and JSON examples, open questions, and a closing list of invariants. A doc that grows past one idea splits into a new doc instead of a new section.
-
-## Open questions
-
-1. **`hs::` or `homestead::`?** The short one is easier to read in code; the long one can't collide with anything.
-2. **One repository build, or one per service?** One CMake tree with every package is simplest while nothing is deployed separately.
-3. **Which payload encoding?** FlatBuffers reads without copying and evolves by adding fields; Protocol Buffers is the most familiar; a small hand-written codec avoids a dependency and a generator. FlatBuffers is the lean.
-4. **Is the handshake's service name enough without TLS?** A shared secret per deployment would stop an accidental cross-wiring of two environments, at the cost of one more thing to configure.
