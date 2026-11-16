@@ -10,7 +10,7 @@ Homestead is a handful of single-machine services and a fleet of stateless barns
 
 Three rules carry most of the weight:
 
-1. **The internet reaches barn, and only barn.** Caddy terminates TLS and speaks plain HTTP to barns. Every other service is on the private network, and reaches the internet only for its one job (barker to a mail provider, pond and ranger to object storage, barn to a box's declared fetches).
+1. **The internet reaches barn, and only barn.** Caddy terminates TLS and speaks plain HTTP to barns. Every other service is on the private network, and reaches the internet only for its one job (barker to a mail provider, pond and ranger to object storage, barn to S3 for a tenant's assets and to the third-party origins a route grants a box, through hound).
 2. **Barn only dials out.** Barn has no internal listener. It dials pond, rancher, permit, sun, barker, store, and ranger, and everything those services push to barn (config, feeds, timer events, suppression lists) arrives on streams barn opened. A barn is added by starting it and removed by stopping it; nobody keeps a list of barns to call.
 3. **Only the dialer opens streams.** A connection has a dialer and a listener. The listener answers and pushes, but never opens a stream, so every stream has one obvious owner and one obvious place to cancel it.
 
@@ -28,8 +28,8 @@ Three rules carry most of the weight:
                      | HTTP           |            | LMTP (Q12.3)
                      v                |            v
    +--------------------------------------------------------------+
-   |  barn  barn  barn  ...   (stateless, horizontal, dial out)   |-----> box fetches
-   +--------------------------------------------------------------+       (declared origins)
+   |  barn  barn  barn  ...   (stateless, horizontal, dial out)   |-----> third-party APIs (hound)
+   +--------------------------------------------------------------+-----> S3 (silo: assets)
      |      |        |        |        |        |        |
      |pond  |rancher |permit  |sun     |barker  |store   |ranger
      v      v        v        v        v        v        v
@@ -44,6 +44,7 @@ Three rules carry most of the weight:
    +--> pond replicas (chain), object storage (snapshots, WAL)
 
    every service --> ranger   (log batches, from a local spool)
+   pond --> barn              (events for event routes, on streams barn opened)
    every service --> rancher  (problem reports; barn and sun also health counts)
    permit, sun, barker, rancher --> pond  (id ranges; deletions; outbox, see Q12.1)
    store --> rancher (table definitions, releases);  permit --> barker (auth mail)
@@ -59,9 +60,12 @@ The dialer is on the left. "call" is a request and one answer; "stream" is a sub
 | Stalwart | barn | Inbound mail, including bounces | LMTP (Q12.3) | the mail edge |
 | barn | pond | Reads, writes, queries, names, ids, waits | call | `pond.get`, `pond.write`, `pond.query`, `pond.names`, `pond.ids.lease`, `pond.wait` |
 | barn | pond | Cache invalidation, SSE, held answers | stream | `pond.feed.subscribe` |
+| barn | pond | Events for `event` routes, leased per route, acknowledged per event | stream, call | `pond.events.subscribe`, `pond.events.ack` |
 | barn | rancher | Configuration, modules | stream, call | `rancher.config.subscribe`, `rancher.box.fetch` |
 | barn, sun | rancher | Health and failure counts, problems | push | `rancher.health.report`, `rancher.problems.report` |
-| barn | rancher, permit, barker, store | The proxied control plane: operator API, sign-in, unsubscribe, site tools | call | `$service.http.serve` |
+| barn | rancher, store | Operator tools, served by porch inside barn as MCP and HTTP | call | `rancher.tools.list`, `rancher.tools.call`, `store.tools.list`, `store.tools.call` |
+| barn | rancher | OpenAPI specs for egress bindings, by hash | call | `rancher.spec.fetch` |
+| barn | permit, barker, store | The proxied pages: sign-in and consent, unsubscribe, store's upload tickets | call | `$service.http.serve` |
 | barn | permit | Signing keys, revocations, grant changes; live grants | stream, call | `permit.keys.subscribe`, `permit.grants.get` |
 | barn | sun | Timer events to run, with credit | stream | `sun.fire.subscribe`, `sun.fire.ack`, `sun.fire.heartbeat` |
 | barn | barker | Suppression hashes; thread notes | stream, call | `barker.suppression.subscribe`, `barker.thread.note`, `barker.bounce.ingest` |
@@ -73,14 +77,15 @@ The dialer is on the left. "call" is a request and one answer; "stream" is a sub
 | rancher | sun | Recurring schedules, dead letters | call | `sun.control.*` |
 | rancher | barker | Operator mail, domains, dead letters | call | `barker.send`, `barker.control.*` |
 | rancher | ranger | Log reads, proxied for operators and agents; a deleted tenant's purge | call, stream | `ranger.search`, `ranger.tail`, `ranger.trace`, `ranger.count`, `ranger.verify`, `ranger.control.*` |
-| rancher | store | Store's site tools, behind the one MCP endpoint on `ops.` | call | `store.http.serve` |
 | permit, sun, barker, rancher | pond | Id ranges | call | `pond.ids.lease` |
 | permit, sun, barker | pond | User and tenant deletions | stream | `pond.deletions.subscribe` (Q12.2) |
 | sun, permit, barker | pond | Outbox elements addressed to them | stream | `pond.outbox.lease`, `pond.outbox.ack` (Q12.1) |
 | permit | barker | Sign-in codes and grant notices | call | `barker.send` |
 | store | rancher | Table definitions; release routes and promotion requests | call | `rancher.tables.get`, `rancher.release.submit`, `rancher.release.propose` |
-| store, barker | rancher | Templates and release names, as configuration | stream | `rancher.config.subscribe` |
+| store, barker, permit | rancher | Templates, table versions, and the role tree, as configuration | stream | `rancher.config.subscribe` |
 | pond | pond | Chain replication of the WAL | push | `pond.replica.append` |
+
+Outside the wire, barn reaches S3 (assets, under a route's prefix rules, with credentials from cellar) and the third-party origins an egress binding names (through hound), and a browser may PUT or GET straight to S3 with a URL a box presigned within its prefix. Farmhand reaches machines over SSH to deploy; it is a tool, not a peer.
 
 Nothing else talks. In particular: **no service but barn and rancher calls pond's data API**, **only rancher calls a control API**, and **nothing calls barn**.
 
@@ -275,16 +280,16 @@ The listener checks the caller's service on every OPEN against its method table.
 | method family | barn | rancher | pond | permit | sun | barker | store | ranger |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `pond.get`, `write`, `query`, `names`, `wait`, `feed.*` | yes | yes | | | | | | |
+| `pond.events.*` | yes | | | | | | | |
 | `pond.ids.lease` | yes | yes | | yes | yes | yes | | |
 | `pond.outbox.*`, `pond.deletions.*` | (Q12.1) | | | yes | yes | yes | | |
 | `pond.replica.*` | | | yes | | | | | |
 | `pond.control.*` | | yes | | | | | | |
-| `rancher.config.subscribe` | yes | | | | | yes | yes | |
-| `rancher.box.fetch` | yes | | | | | | | |
+| `rancher.config.subscribe` | yes | | | yes | | yes | yes | |
+| `rancher.box.fetch`, `spec.fetch`, `tools.*` | yes | | | | | | | |
 | `rancher.health.report` | yes | | | | yes | | | |
 | `rancher.problems.report` | yes | | yes | yes | yes | yes | yes | yes |
 | `rancher.tables.get`, `release.*` | | | | | | | yes | |
-| `rancher.http.serve` | yes | | | | | | | |
 | `permit.keys.*`, `grants.get`, `http.serve` | yes | | | | | | | |
 | `permit.effects.apply` | (Q12.1) | | | | | | | |
 | `permit.control.*` | | yes | | | | | | |
@@ -295,7 +300,7 @@ The listener checks the caller's service on every OPEN against its method table.
 | `barker.suppression.*`, `thread.note`, `bounce.ingest`, `http.serve` | yes | | | | | | | |
 | `barker.control.*` | | yes | | | | | | |
 | `store.release.fetch` | yes | | | | | | | |
-| `store.http.serve` | yes | yes | | | | | | |
+| `store.tools.*`, `http.serve` | yes | | | | | | | |
 | `ranger.ingest` | yes | yes | yes | yes | yes | yes | yes | |
 | `ranger.search`, `tail`, `trace`, `count`, `verify`, `control.*` | | yes | | | | | | |
 
@@ -303,7 +308,11 @@ A refused OPEN is answered `refused` and reported as a problem, since a service 
 
 ### The proxied control plane
 
-The operator API, sign-in pages, consent screens, unsubscribe links, and site tools are served by rancher, permit, barker, and store, but they are reached from the internet through barn. Barn doesn't interpret them. It carries each request as an opaque `http.serve` call:
+Two kinds of control-plane traffic reach services through barn.
+
+**Operator tools** are typed. Each service that owns tools (rancher, and store for the site; rancher also fronts sun's, barker's, and ranger's) answers `tools.list` with descriptors (`name`, `summary`, `input_schema`, `roles`, `changes`) and `tools.call` with the caller attached. [Porch](../porch/IDEA.md), a library inside barn, gathers the catalogs and serves them as MCP at `/mcp` and `/mcp/{role}`, and as JSON at `/_ops/api/{tool}`, on `ops.` domains. The role in the path narrows the catalog; the caller's `ops/{role}` grants decide; the owning service checks again.
+
+**Pages** are opaque: sign-in pages, consent screens, unsubscribe links, and store's upload tickets. Barn doesn't interpret them. It carries each request as an `http.serve` call:
 
 ```
 table HttpRequest {
@@ -321,8 +330,9 @@ table HttpResponse { status: uint16; headers: [Header]; body: [ubyte]; }
 | --- | --- |
 | `/_permit/` | permit: sign-in, passkeys, consent, OAuth endpoints |
 | `/_unsubscribe/`, `/_barker/` | barker: one-click unsubscribe, provider notifications |
-| `/_ops/` on `ops.` | rancher's operator API; `/_ops/site/` goes to store directly |
-| `/mcp` on `ops.` | rancher, which serves one MCP endpoint per `ops.` domain and forwards site tools to `store.http.serve`, so an agent connects once |
+| `/_ops/site/upload/` on `ops.` | store: one-time upload tickets for site attachments |
+| `/mcp`, `/mcp/{role}`, `/_ops/api/` on `ops.` | not proxied: porch, in barn, calls `rancher.tools.*` and `store.tools.*` |
+| `/_hound/connect/` | not proxied: barn and hound run the OAuth connect flow for an egress binding |
 
 Barn resolves the tenant from the domain before it proxies, exactly as for a box route, so a proxied service gets a tenant it can trust and never takes one from a path or header. Bodies are capped (1 MiB, larger for store's uploads by ticket), and the proxied service sees only what the request carried; barn adds no credentials of its own.
 
@@ -334,6 +344,7 @@ Security on the wire is optional and pluggable, as [common](../common.md#securit
 - **Mutual TLS** (TLS 1.3 only, through OpenSSL under Asio) wraps the connection before the preface. Each host has a certificate from the deployment's CA whose subject alternative name is a URI, `homestead://$service/$host`, like `homestead://barn/barn-7`. The listener takes the caller's service from that URI, refuses a HELLO that names a different one, and applies the method table to the certificate's service. A host certificate can name one service; a machine running several services has one certificate each.
 - **`require`** refuses plaintext peers, so a deployment moves to TLS one host at a time and then locks.
 - **Rotation** is a SIGHUP: new connections use the new certificate, and existing ones live out their lifetime (at most 24 hours; connections older than that are drained with GOAWAY and reopened).
+- **Secrets ride only sealed.** Rancher's config log carries secrets sealed to the deployment's wrap key, and only to the services a secret names; only a host whose vault holds the unwrap key can open one, with [cellar](../cellar/IDEA.md).
 - **No secret ever rides in the envelope.** Tokens a box's caller presented are verified in barn and never forwarded; what crosses the wire is a subject id and grants, which the listener already trusts barn to say.
 - **The tenant on the wire is barn's or rancher's word.** Pond, permit, sun, and barker trust the tenant a barn or rancher names, and refuse one from any other caller. `Open.tenant` is for logs and placement only; authority is the payload's, checked against the caller's service.
 

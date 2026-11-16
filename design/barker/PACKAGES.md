@@ -64,7 +64,7 @@ Everything around them (rendering, MIME, queueing, retries, limits, providers, D
 - **Won't.** Decide what a bounce means, store an address, or know about templates.
 
 ### barker_dkim (R0)
-- **Promise.** A signature verifies under the published record for every message barker builds, and a key never leaves the key store reference except into the signer.
+- **Promise.** A signature verifies under the published record for every message barker builds, and a key is opened with cellar only into the signer, and never written anywhere in plaintext.
 - **Tests.** RFC 6376 and RFC 8463 test vectors; round trips through an independent verifier (OpenDKIM's test suite in CI); folded headers, 8-bit bodies, trailing whitespace.
 - **Won't.** Build MIME, choose a key, or look up DNS.
 

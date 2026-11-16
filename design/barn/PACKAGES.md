@@ -13,8 +13,12 @@ Barn is the largest service, because it is where every protocol, every box, and 
 - **`barn_iron`** turns a box's staged calls into exactly one compare-and-set write.
 - **`barn_abi`** copies bytes across the guest boundary.
 - **`barn_wasm`** confines the box: isolation levels, resets, and limits.
+- **`barn_silo`** keeps every S3 key under the prefix its route resolved, with the tenant first.
+- **`barn_egress`** keeps every outbound call on the origin, prefixes, and methods its route bound, and keeps credentials out of the box.
 
 Everything else is R1 or lower, because its worst bug is a wrong answer or a slow one, not a reach. Routing (`barn_route`, `barn_policy`) picks which route and version answer, but every route it can pick was checked by rancher, and the R0 packages enforce that route's rules whatever was picked. The cache is R1 because it holds only what pond already decided a caller may see under that grant, and its keys always include the tenant and grant. The evaluator (`barn_eval`) is R1 because it only sequences R0 decisions; it may not make one.
+
+Three libraries do heavy lifting inside barn without being barn's: [hound](../hound/PACKAGES.md) builds and sends third-party HTTP (and knows OpenAPI), [porch](../porch/PACKAGES.md) is the operator tool catalog and its MCP server, and [cellar](../cellar/PACKAGES.md) unwraps sealed secrets. Barn's R0 packages are what bind each of them to a route: `barn_egress` decides whether hound may send, and hound never decides that itself.
 
 Barn has **no `barn_server` and no `barn_proto`**. Nothing dials barn on the wire, so it has no schema to publish, and no `barn_client` or `barn_fake` exists for anyone to depend on.
 
@@ -23,23 +27,28 @@ Barn has **no `barn_server` and no `barn_proto`**. Nothing dials barn on the wir
 | package | namespace | does | depends on | tier |
 | --- | --- | --- | --- | --- |
 | `barn_config` | `homestead::barn::config` | Holds the live configuration: takes rancher's snapshot, follows the config log in order, and publishes immutable `View`s (routes, services, domains, releases) by config seq | `rancher_client`, `rancher_model`, `common_core` | R1 |
-| `barn_route` | `homestead::barn::route` | Domain to tenant and environment (prod, beta, ops); request to exactly one route by verb, domain, and typed path; `mcp`, `mail`, `timer`, `sse` keys | `rancher_model`, `common_core` | R1 |
+| `barn_route` | `homestead::barn::route` | Domain to tenant and environment (prod, beta, ops); request to exactly one route by verb, domain, and typed path; `mcp`, `mail`, `timer`, `event`, `sse` keys | `rancher_model`, `common_core` | R1 |
 | `barn_policy` | `homestead::barn::policy` | Picks a box version by weights and a stable hash of user, ip, or request; names shadows | `rancher_model`, `common_crypto` | R1 |
 | `barn_caller` | `homestead::barn::caller` | Verifies tokens with permit's keys, holds the grants cache and revocations, evaluates the route's requirement, binds parameters | `permit_token`, `permit_require`, `permit_client`, `common_core` | R0 |
 | `barn_objects` | `homestead::barn::objects` | Resolves each slot to a key: reserved values, bound params only, `new` from `barn_ids`, `name:` through pond; loads documents and seqs | `rancher_model`, `barn_ids`, `pond_client` | R0 |
 | `barn_ids` | `homestead::barn::ids` | Leases id ranges from pond and mints from them; leases the next range before the current one runs out | `pond_client`, `common_core` | R1 |
 | `barn_iron` | `homestead::barn::iron` | Stages merges, deletes, holds, and effects per slot; composes patches; builds one pond write with `if-seq` per object and the request id as idempotency key | `common_merge`, `rancher_model`, `pond_client` (types only) | R0 |
-| `barn_abi` | `homestead::barn::abi` | The host side of `barn-abi@1` and `iron@1`: bounds-checked copies in and out of guest memory, argument decoding, calls into the request context | `barn_iron`, `common_core`, wasmtime (types) | R0 |
+| `barn_abi` | `homestead::barn::abi` | The host side of `barn-abi@1`, `iron@1`, `silo@1`, and `hound@1`: bounds-checked copies in and out of guest memory, argument decoding, calls into the request context | `barn_iron`, `barn_silo`, `barn_egress`, `common_core`, wasmtime (types) | R0 |
 | `barn_wasm` | `homestead::barn::wasm` | wasmtime engine and compile cache, instance pools per isolation level, reset to snapshot with verification, fuel, memory, epoch deadlines | `barn_modules`, wasmtime | R0 |
 | `barn_modules` | `homestead::barn::modules` | Fetches modules from rancher by hash, verifies the hash, caches them on disk forever | `rancher_client`, `common_crypto` | R2 |
 | `barn_cache` | `homestead::barn::cache` | Objects by key, names forever, query answers by tenant, grant, canonical SQL, and params; invalidation from pond's feed; reset drops a tenant | `pond_client`, `common_core` | R1 |
 | `barn_eval` | `homestead::barn::eval` | The pipeline: domain, caller, route, version, objects, box, write, hold, then, encode; shadows; outcomes to statuses | every core package above, `pond_client` | R1 |
 | `barn_query` | `homestead::barn::query` | Runs `query.named` and `query.sql` for a box: attaches the route's grant and reserved params, goes through the cache, optional early fork check | `pond_client`, `barn_cache`, `fork_api` (optional) | R1 |
-| `barn_fetch` | `homestead::barn::fetch` | Egress for `fetch.call`: declared origins only, shadow-safe check, timeouts, `egress` lines | `common_http`, `rancher_model`, `common_log` | R1 |
-| `barn_edge` | `homestead::barn::edge` | The HTTP server on 8080: parsing, header stripping and ownership, reserved prefixes, health, statuses | `common_http`, `barn_eval`, `barn_proxy` | R1 |
-| `barn_proxy` | `homestead::barn::proxy` | Carries reserved-prefix requests opaquely as `http.serve` to rancher, permit, barker, store | `common_http`, the four `_client`s | R1 |
+| `barn_egress` | `homestead::barn::egress` | Binds `hound@1` to the route: service name to origin, path normalized under a prefix, method allowed, refused headers, redirects kept in bounds, rate per tenant, shadow effect-free check; hands hound the credential reference; `egress` lines | `hound_policy`, `hound_client`, `hound_auth`, `cellar_api`, `rancher_model`, `common_log` | R0 |
+| `barn_connect` | `homestead::barn::connect` | `/_hound/connect/{name}`: the OAuth dance through hound, tokens sealed by cellar and written to `_credentials/{user}` as a system write; refreshed tokens written back | `hound_auth`, `hound_client`, `cellar_api`, `pond_client`, `barn_caller` | R1 |
+| `barn_silo` | `homestead::barn::silo` | The host side of `silo@1`: asset name to resolved prefix with the tenant first, key normalization and the under-prefix check, access per call, type sniffing, presign conditions | `common_blob`, `rancher_model`, `common_core` | R0 |
+| `barn_upload` | `homestead::barn::upload` | `serve`, `upload`, and `attachments`: streaming bodies and multipart parts to S3 without buffering them whole, ETag and Range, size and count caps, best-effort cleanup after a failed box | `barn_silo`, `common_http`, `common_blob` | R1 |
+| `barn_events` | `homestead::barn::events` | `pond.events.subscribe` with credit, evaluation as event requests, acks with outcomes, shadowing beta-only event routes | `pond_client`, `barn_eval` | R1 |
+| `barn_secrets` | `homestead::barn::secrets` | Sealed secrets from the config log, unwrapped through cellar at use, kept in memory with a short TTL, unwrap counts and `audit` lines | `cellar_api`, `barn_config`, `common_log` | R1 |
+| `barn_edge` | `homestead::barn::edge` | The HTTP server on 8080: parsing, header stripping and ownership, reserved prefixes, health, statuses | `common_http`, `barn_eval`, `barn_proxy`, `barn_upload`, `barn_mcp` | R1 |
+| `barn_proxy` | `homestead::barn::proxy` | Carries reserved-prefix requests opaquely as `http.serve` to permit, barker, and store (upload tickets) | `common_http`, the three `_client`s | R1 |
 | `barn_sse` | `homestead::barn::sse` | Streams: feed subscriptions per route group, fan-out by `per-viewer`, resume by `Last-Event-ID`, close on revocation | `pond_client`, `barn_eval` | R1 |
-| `barn_mcp` | `homestead::barn::mcp` | MCP over streamable HTTP: `tools/list` from routes and grants, `tools/call` through `barn_eval` | `common_http`, `barn_eval` | R2 |
+| `barn_mcp` | `homestead::barn::mcp` | `/mcp` and `/mcp/{role}`: on tenant domains, `tools/list` from `mcp` routes by `roles` tag and grants, `tools/call` through `barn_eval`; on `ops.`, hands the session to porch with the caller's subject and grants; `/_ops/api/{tool}` the same | `porch` (the facade), `rancher_client`, `store_client`, `barn_caller`, `barn_eval` | R1 |
 | `barn_mail` | `homestead::barn::mail` | LMTP on 2424, recipient to route, reply tokens, bounces to barker, thread notes | `barker_reply`, `barker_client`, `barn_eval` | R1 |
 | `barn_timer` | `homestead::barn::timer` | `sun.fire.subscribe` with credit, evaluation as timer requests, acks and heartbeats | `sun_client`, `barn_eval` | R1 |
 | `barn_stitch` | `homestead::barn::stitch` | Fetches releases from store, serves page plans, runs slots in parallel under deadlines with fallbacks, page caching | `store_plan`, `store_client`, `common_mustache`, `barn_query`, `barn_eval` | R1 |
@@ -54,17 +63,18 @@ Barn has **no `barn_server` and no `barn_proto`**. Nothing dials barn on the wir
           +-------------+-----------+-----------+-------------+------------+
        barn_edge    barn_sse    barn_mcp    barn_mail    barn_timer   barn_stitch
           |  \          |           |           |            |            |
-     barn_proxy +-------+-----------+-----------+------------+------------+
+     barn_proxy +-------+-----------+-----------+------------+------------+---- barn_events
+     barn_upload            porch (library)                                       barn_connect
                                      |
                                  barn_eval  (R1: sequences, decides nothing)
      +-----------+-----------+-------+-------+-----------+------------+-----------+
- barn_route  barn_policy  barn_caller  barn_objects  barn_wasm   barn_query  barn_fetch
-     |           |          (R0)       (R0)  |       (R0) |           |
-     +-----+-----+           |          barn_ids   barn_abi (R0)   barn_cache
-           |                 |                       |
-     barn_config      permit_token            barn_iron (R0)
-           |          permit_require                 |
-     rancher_model                             common_merge
+ barn_route  barn_policy  barn_caller  barn_objects  barn_wasm   barn_query  barn_secrets
+     |           |          (R0)       (R0)  |       (R0) |           |           |
+     +-----+-----+           |          barn_ids   barn_abi (R0)   barn_cache   cellar (library)
+           |                 |              +--------+---+---------+
+     barn_config      permit_token     barn_iron  barn_silo  barn_egress   (all R0)
+           |          permit_require       |          |           |
+     rancher_model                   common_merge  common_blob  hound (library)
            \__________ _client interfaces: pond, rancher, permit, sun, barker, store _____/
                                      |
                          common_wire, common_log, common_*
@@ -82,6 +92,10 @@ Barn has **no `barn_server` and no `barn_proto`**. Nothing dials barn on the wir
 
 **barn_abi.** *Promise:* no host call reads or writes guest memory outside the range it was given, and every host call's arguments are validated before use. *Tests:* fuzzed pointers and lengths at every import, zero-length, overflow, and out-of-bounds ranges; generated WIT bindings checked against the published `barn-abi@1` and `iron@1`. *Won't:* hold state between requests; decide policy.
 
+**barn_silo.** *Promise:* every S3 key barn touches for a box is `t/{tenant}/` plus the asset's resolved prefix plus a normalized key, and no call outside the route's `access` reaches S3; a presign carries the prefix, size, and type conditions. *Tests:* a corpus of hostile keys (`..`, `%2e%2e`, `//`, trailing `/`, unicode lookalikes, control bytes, 1,025-byte keys); prefixes with reserved values from different callers; every access row; presigned policies decoded and checked. *Won't:* stream bodies (that's `barn_upload`), track references, or garbage-collect.
+
+**barn_egress.** *Promise:* a request leaves only for the origin its service name binds, on a path that normalizes under a listed prefix, with a listed method, without any header the box may not set, and with the credential hound attaches; a redirect outside those bounds is returned, not followed. *Tests:* path tricks (`/api/v3/../../admin`, encoded slashes, `;` params, absolute URLs in `path`), header smuggling (case, duplicates, `\r\n`), redirects off origin, rate under concurrency, shadow runs. *Won't:* parse OpenAPI or speak OAuth (hound does), or hold plaintext secrets past the call.
+
 **barn_wasm.** *Promise:* a box gets only the imports its world declares; fuel, memory, and deadline are always enforced; `reset` restores memory and globals to the snapshot byte for byte, verified on a sample of resets and on every reset in tests; `tenant` and `shared` never mix what they promise not to. *Tests:* hostile modules (infinite loops, memory growth, deep recursion, stray imports, a box that stashes data in globals and checks for it after a reset); reset cost measured in a benchmark that fails on regression. *Won't:* know about routes, tenants beyond a pool key, or pond.
 
 ### R1
@@ -98,18 +112,26 @@ Barn has **no `barn_server` and no `barn_proto`**. Nothing dials barn on the wir
 
 **barn_eval.** *Promise:* the nine steps run in order, a failure at any step writes nothing, and every outcome maps to one status and one counter. *Tests:* against fakes of every client, one test per row of the status table. *Won't:* make an access decision itself.
 
-**barn_query, barn_fetch, barn_proxy, barn_edge, barn_sse, barn_mail, barn_timer, barn_stitch.** Each promises its protocol faithfully and its limits always; each is tested against fakes and the in-memory network. `barn_proxy` *won't* read a body or add a credential; `barn_fetch` *won't* reach an undeclared origin; `barn_timer` *won't* hold more events than its credit; `barn_stitch` *won't* let a slot's output be scanned for directives.
+**barn_events.** *Promise:* every leased event is acknowledged with exactly one outcome or its lease expires; the write carries `event:{route}:{seq}`; a beta-only event route never writes. *Tests:* redelivery after a lost ack writes once; events for one id stay in order; credit never exceeded; a route removed mid-lease is `skipped`. *Won't:* keep a cursor (pond does).
+
+**barn_upload.** *Promise:* bodies and parts stream to S3 in bounded memory; caps abort the upload and delete what was written; a failed box's attachments are deleted or reported. *Tests:* slow clients, truncated multipart, a 10 GiB body against a 10 MiB cap, Range edge cases, ETag round trips against `common_blob`'s local implementation. *Won't:* decide keys outside `barn_silo`.
+
+**barn_mcp.** *Promise:* a tool is listed only if its role matches the path and callable only if the caller's grants allow it, on tenant domains and on `ops.`. *Tests:* every role path against every grant shape; sub-agent tokens narrower than their subject. *Won't:* define operator tools (porch and their owners do).
+
+**barn_secrets, barn_connect.** *Promise:* plaintext lives only in memory, only as long as the TTL, never in a log or a box; connected tokens are sealed before they reach pond. *Tests:* logs and problem records scanned for test secrets; a token refresh written once under concurrency.
+
+**barn_query, barn_proxy, barn_edge, barn_sse, barn_mail, barn_timer, barn_stitch.** Each promises its protocol faithfully and its limits always; each is tested against fakes and the in-memory network. `barn_proxy` *won't* read a body or add a credential; `barn_timer` *won't* hold more events than its credit; `barn_stitch` *won't* let a slot's output be scanned for directives.
 
 ## How it's wired
 
 `barn_system` builds, in this order:
 
-1. **Clients.** One wire connection to each peer: rancher, pond, permit, sun, barker, store, ranger. `common_log`'s spool starts shipping to ranger.
-2. **Config.** `barn_config` opens `rancher.config.subscribe` and waits for the snapshot.
+1. **Clients.** One wire connection to each peer: rancher, pond, permit, sun, barker, store, ranger. `common_log`'s spool starts shipping to ranger. The vault key is loaded into cellar, and the S3 client is built from barn's config.
+2. **Config.** `barn_config` opens `rancher.config.subscribe` and waits for the snapshot, which carries sealed secrets as well as routes. `barn_secrets` checks it can unwrap the S3 credential before going on.
 3. **Modules.** `barn_modules` fetches every live box version named in the snapshot; `barn_wasm` compiles them and takes reset snapshots.
 4. **Ids.** `barn_ids` leases its first range.
 5. **Subscriptions.** `permit.keys.subscribe`, `barker.suppression.subscribe`, and `pond.feed.subscribe` for cache invalidation.
-6. **Ready.** Health turns 200. Only now does `barn_timer` open `sun.fire.subscribe`, and only now does Caddy send traffic.
+6. **Ready.** Health turns 200. Only now do `barn_timer` and `barn_events` open `sun.fire.subscribe` and `pond.events.subscribe`, and only now does Caddy send traffic.
 
 Barn serves nothing until step 6: no snapshot, compiled boxes, and id range means a failing health check and no timer credit.
 
@@ -122,16 +144,16 @@ Barn serves nothing until step 6: no snapshot, compiled boxes, and id range mean
 
 A request is parsed on a network thread, posted to the box pool when it needs a box, and its pond calls are async on the network pool. Credit to sun is the box pool's free capacity.
 
-**Shutdown.** Health turns 503; barn stops granting sun credit and acks or fails what it holds; it finishes in-flight requests up to their deadlines; SSE streams close with a retry hint; it sends GOAWAY on every connection; the spool flushes to ranger. An unused id range is simply abandoned (gaps are fine).
+**Shutdown.** Health turns 503; barn stops granting sun and pond events credit and acks or fails what it holds; in-flight uploads finish or abort and clean up; it finishes in-flight requests up to their deadlines; SSE streams close with a retry hint; it sends GOAWAY on every connection; the spool flushes to ranger. An unused id range is simply abandoned (gaps are fine).
 
 ## Review queue
 
 | order | packages | tier |
 | --- | --- | --- |
-| 1 | `barn_iron`, `barn_abi`, `barn_objects`, `barn_caller`, `barn_wasm` | R0: every line, adversarial agent review first, fuzzing required |
-| 2 | `barn_eval`, `barn_config`, `barn_route`, `barn_policy`, `barn_cache`, `barn_ids`, `barn_query`, `barn_proxy`, `barn_fetch` | R1, the request path |
-| 3 | `barn_edge`, `barn_sse`, `barn_mail`, `barn_timer`, `barn_stitch` | R1, the protocols |
-| 4 | `barn_mcp`, `barn_modules`, `barn_routelog`, `barn_system` | R2 |
+| 1 | `barn_iron`, `barn_abi`, `barn_objects`, `barn_caller`, `barn_wasm`, `barn_silo`, `barn_egress` | R0: every line, adversarial agent review first, fuzzing required |
+| 2 | `barn_eval`, `barn_config`, `barn_route`, `barn_policy`, `barn_cache`, `barn_ids`, `barn_query`, `barn_proxy`, `barn_secrets`, `barn_mcp` | R1, the request path and the gates around it |
+| 3 | `barn_edge`, `barn_upload`, `barn_connect`, `barn_events`, `barn_sse`, `barn_mail`, `barn_timer`, `barn_stitch` | R1, the protocols |
+| 4 | `barn_modules`, `barn_routelog`, `barn_system` | R2 |
 | 5 | `barn_main` | R3 |
 
 **Build order.** Agents can work in parallel along these lanes, each against fakes, meeting only at `barn_eval`:
@@ -141,12 +163,14 @@ A request is parsed on a network thread, posted to the box pool when it needs a 
 3. `barn_caller` (against `permit_token` test vectors), `barn_objects` and `barn_ids` (against `pond_fake`).
 4. `barn_cache` and `barn_query` (against `pond_fake`).
 5. `barn_eval`, then `barn_edge` and `barn_proxy`, which make the first HTTP request work end to end in `sim_world`.
-6. The protocols (`barn_sse`, `barn_mcp`, `barn_mail`, `barn_timer`, `barn_stitch`, `barn_fetch`) in any order.
+6. `barn_silo` and `barn_upload` (against `common_blob`'s local directory), `barn_egress` and `barn_connect` (against hound's recorded exchanges), `barn_secrets` (against cellar's test vault).
+7. The protocols (`barn_sse`, `barn_mcp` with porch, `barn_mail`, `barn_timer`, `barn_events`, `barn_stitch`) in any order.
 
 ## The invariants
 
 - **The R0 line is reach.** Code that decides who the caller is, which keys a box gets, what it writes, or what it can touch in memory is R0; nothing else is.
 - **`barn_eval` sequences, it doesn't decide.** Every access decision lives in an R0 package.
+- **Libraries do the work; barn's R0 packages draw the line.** Hound sends, porch lists, cellar unwraps; `barn_egress`, `barn_silo`, `barn_mcp`, and `barn_caller` decide whether they may.
 - **No `barn_server`, `barn_proto`, `barn_client`, or `barn_fake`.** Nothing dials barn.
 - **Every other service is reached through its `_client` interface,** and every one has a fake barn's tests use.
 - **Network threads never run a box; box threads never block on the network.**

@@ -176,7 +176,7 @@ Barker sends; barn receives, through its mail routes and the receiver. They touc
 
 ## Storage
 
-Barker keeps its own SQLite database: the queue (by next attempt), the dead letter box, suppression, counts, domains and their DKIM keys (keys by reference to the key store), and recent Message-IDs as hashes. Rendered bodies stay only until delivered or 7 days dead. Barker's clock is injected, so tests run retries by hand.
+Barker keeps its own SQLite database: the queue (by next attempt), the dead letter box, suppression, counts, domains and their DKIM keys (sealed secrets, opened at signing with [cellar](../cellar/IDEA.md)), and recent Message-IDs as hashes. Rendered bodies stay only until delivered or 7 days dead. Barker's clock is injected, so tests run retries by hand.
 
 ## Problems and logs
 

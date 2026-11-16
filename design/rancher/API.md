@@ -6,7 +6,7 @@ What barns follow, what every service reports, and what operators and agents cha
 
 ## The idea
 
-Rancher has three audiences, and its API is cut the same way. **Barns** follow it: a snapshot of the live configuration, then every change in order, and the modules it names. **Every service** reports to it: problems, and from barn and sun, health counts. **Operators and agents** change it: tenants, domains, boxes, services, routes, tables, schedules, promotions, and the problem log. The first two are wire methods, small and fixed. The third is the operator API, which is large and grows, so it rides one wire method, `rancher.http.serve`, proxied by barn from `ops.` domains as HTTP and MCP.
+Rancher has three audiences, and its API is cut the same way. **Barns** follow it: a snapshot of the live configuration, then every change in order, and the modules and OpenAPI specs it names. **Every service** reports to it: problems, and from barn and sun, health counts. **Operators and agents** change it: tenants, domains, boxes, services, routes, tables, schedules, secrets, promotions, and the problem log. The first two are wire methods, small and fixed. The third is the operator tools, which are many and grow, so they ride two wire methods, `rancher.tools.list` and `rancher.tools.call`, which [porch](../porch/IDEA.md) (a library inside barn) serves to people and agents over MCP and HTTP on `ops.` domains, filtered by role.
 
 Rancher also calls out: it is the only caller of pond's, permit's, sun's, and barker's control APIs, and the proxy for ranger's reads. Those calls are listed at the end, so the whole control plane is visible in one place.
 
@@ -16,12 +16,16 @@ Rancher also calls out: it is the only caller of pond's, permit's, sun's, and ba
 | --- | --- | --- | --- | --- |
 | `rancher.config.subscribe` | stream | barn, barker, store | no | A snapshot at a seq, then config events in seq order |
 | `rancher.box.fetch` | call (chunked answer) | barn | no | A module's bytes by hash |
+| `rancher.spec.fetch` | call (chunked answer) | barn | no | An OpenAPI spec's bytes by hash |
 | `rancher.health.report` | push | barn, sun | yes (counts) | Acknowledged seq |
 | `rancher.problems.report` | push | every service | yes (the problem log) | Acknowledged seq |
 | `rancher.tables.get` | call | store | no | Table versions with columns and types |
 | `rancher.release.submit` | call | store | yes (beta) | The release's routes, checked, and the config seq that serves them |
 | `rancher.release.propose` | call | store | yes (a pending promotion) | A promotion id for a person to approve |
-| `rancher.http.serve` | call | barn | depends on the path | An `HttpResponse`: the operator API over HTTP and MCP |
+| `rancher.tools.list` | call | barn (porch) | no | Tool descriptors, with roles, including the sun, barker, and ranger tools rancher proxies |
+| `rancher.tools.call` | call | barn (porch) | depends on the tool | The tool's answer, with `seq`, `widens`, `undo`, and `problems` for changing tools |
+
+`rancher.tools.*` replaces the earlier `rancher.http.serve`: rancher no longer speaks HTTP or MCP at all, porch does.
 
 Every changing wire call carries an idempotency key in `Open`, as [network](../common/NETWORK.md#calls) requires.
 
@@ -54,11 +58,16 @@ The stream starts with a snapshot when `from` is 0 or too old, then follows the 
 | `tenant.put`, `tenant.state` | A tenant, its state and quotas | Serves, suspends, or refuses its domains |
 | `domain.put`, `domain.drop` | A domain, its tenant, and its role: primary, redirect, beta, ops | Updates the domain registry |
 | `box.pull` | A box version barns must compile before traffic | Fetches, compiles, reports ready in `health.report` |
+| `spec.put` | An OpenAPI spec by hash, for egress bindings | Fetches it with `spec.fetch` before a route that names it goes live |
+| `secret.put`, `secret.drop` | A sealed secret by name, sent only to the services in its `for` list | Keeps the ciphertext; opens it with cellar at use |
+| `role.put` | The deployment's role tree (also followed by permit, for consent and delegation) | Porch filters `/mcp/{role}` with it |
+| `catalog.put` | A tool owner's catalog moved to a new version (a rancher or store build) | Porch drops that owner's cached catalog |
 | `box.drop` | A version no policy names any more | Frees its instances; keeps the module on disk |
 | `service.policy` | A service's policy in one environment | Picks versions by the new weights |
 | `route.put`, `route.drop` | A whole route, in one environment | Rebuilds the routing table |
 | `table.put`, `table.drop` | A table version, for grant resolution | Nothing beyond caching |
 | `schedule.put`, `schedule.drop` | A recurring schedule (for barn's timer routes) | Nothing; sun fires |
+| `route.put` for an `event` route | The route, with `env` and `shadow: true` while it is beta-only | Runs events pond leases to it; a shadow's merges are recorded and discarded |
 | `release.put`, `release.policy` | A store release and the `site` service's policy | Fetches the release from store, then serves it |
 | `template.put` | A mail template | Barn checks box mail against it; barker renders it |
 | `limits.put` | Rate and quota limits per tenant and route | Enforces them |
@@ -75,6 +84,10 @@ The stream starts with a snapshot when `from` is 0 or too old, then follows the 
 ```
 
 The answer is a stream of chunks of at most 1 MiB, each `{ "offset": 0, "bytes": "...", "last": false }`, then a `Status`. Modules are content-addressed, so a barn checks the hash of what it received and may resume from an offset. `not_found` means the module was never uploaded.
+
+### `rancher.spec.fetch`
+
+The same shape as `box.fetch`: `{ "spec": "sha256:41d0...", "offset": 0 }`, answered in chunks. Barn checks the hash and caches specs forever.
 
 ## Reports
 
@@ -128,9 +141,36 @@ Sun's report has the same shape with timer outcomes (`fired`, `done`, `failed`, 
 
 A submitted release lands in beta at once, as the `site` service's live version there. Production moves only when a person approves a proposed promotion.
 
-## The operator API
+## The operator tools
 
-The operator API is served by `rancher.http.serve`, at `/_ops/api/` on a tenant's `ops.` domain (and the platform's own ops domain for host operators), and as MCP tools at `/mcp` on the same domain. Each tool is one HTTP endpoint with a JSON body; the MCP tool and the endpoint share a name and a schema.
+### `rancher.tools.list` and `rancher.tools.call`
+
+```json
+{ "caller": { "tenant": "bobs_plumbing", "subject": "4294967100", "kind": "agent", "grants": ["ops/content", "ops/observe"] } }
+```
+
+```json
+{ "tools": [
+	{ "name": "problem_list", "summary": "Problems, newest first", "roles": ["observe"], "changes": false, "input": { } },
+	{ "name": "route_put", "summary": "Put a route in beta", "roles": ["deploy"], "changes": true, "input": { } } ],
+  "roles": { "admin": ["deploy", "content", "data", "observe", "mail", "identity"] } }
+```
+
+```json
+{ "tool": "route_put", "args": { "env": "beta", "route": { }, "dry_run": true },
+  "caller": { "tenant": "bobs_plumbing", "subject": "4294967100", "kind": "agent", "grants": ["ops/deploy"] } }
+```
+
+| field | meaning |
+| --- | --- |
+| caller | Who porch says is calling: tenant (from the domain), subject, token kind, and grants, all verified by barn. Rancher trusts it from barn and nobody else. |
+| roles | A tool's roles. A caller may call a tool only if it holds `ops/{role}` for one of them, or `ops/admin`, or is a host operator; rancher checks again on every call, whatever porch filtered. |
+| changes | Whether the tool changes anything; changing tools take the fields below and are refused for read-only tokens. |
+| input | The tool's JSON Schema, the same for MCP and HTTP. |
+
+`tools.list` answers every tool the caller may call, with the role tree; porch narrows it by the `/mcp/{role}` path. Tools rancher proxies (sun's and barker's dead letters, ranger's logs) appear in the list with their own roles (`observe`, `mail`) and are forwarded by rancher with the caller's scope.
+
+Porch serves these tools at `/mcp`, `/mcp/{role}`, and `/_ops/api/{tool}` on a tenant's `ops.` domain (and the platform's own ops domain for host operators). Each tool is one HTTP endpoint with a JSON body; the MCP tool and the endpoint share a name and a schema.
 
 ### Every changing call
 
@@ -164,7 +204,11 @@ Goober's engineering practice, applied uniformly:
 | domains | `domain_put`, `domain_drop`, `domain_verify` | Add a domain with a role; verification answers the DNS record to publish and whether it is there. |
 | boxes | `box_upload`, `box_get`, `box_list`, `box_diff` | Upload checks imports against `abi`, exports, and `writes`; answers `widens` against the previous version of the same box name. |
 | services | `service_put`, `policy_put`, `ramp`, `shadow`, `rollback`, `service_health` | `ramp` moves weight in steps with guardrails; `rollback` returns to the previous policy. |
-| routes | `route_put`, `route_drop`, `route_get`, `route_list`, `route_check`, `route_try` | `route_check` is the full check without storing; `route_try` runs a route on any version, dark ones included, through a barn, with writes discarded. |
+| routes | `route_put`, `route_drop`, `route_get`, `route_list`, `route_check`, `route_try` | `route_check` is the full check without storing; `route_try` runs a route on any version, dark ones included, through a barn, with writes discarded. Event routes are tried with a synthetic event. |
+| events | `event_status`, `event_dead_list`, `event_redrive`, `event_discard` | Each event route's cursor lag, and its dead events, through `pond.control.events.*`. Roles: `data`, `observe`. |
+| specs | `spec_upload`, `spec_get`, `spec_list` | OpenAPI documents for egress, stored by hash. Role: `deploy`. |
+| secrets | `secret_put`, `secret_list`, `secret_drop`, `secret_rotate` | Write-only: put seals the value with cellar and stores ciphertext; list answers names, `for`, fingerprints, and dates, never values; rotate puts a new value under the same name and keeps the previous one until barns confirm. Roles: `admin`, or `deploy` for tenant secrets. |
+| roles | `role_list`, `role_put` | The role tree. Host operators only. |
 | tables | `table_put`, `table_drop`, `table_status` | Put builds a version beside the others; drop is refused while a route names it. |
 | schedules | `schedule_put`, `schedule_drop` | Recurring timers on timer routes, applied to sun. |
 | promotion | `promotion_diff`, `promotion_create`, `promotion_approve`, `promotion_reject`, `promotion_list` | The bulk review: one diff, approved whole or in part, by a person. |
@@ -204,7 +248,7 @@ Goober's engineering practice, applied uniformly:
 
 | to | methods | for |
 | --- | --- | --- |
-| pond | `pond.control.tenant.create`, `.suspend`, `.delete`, `pond.control.user.delete`, `pond.control.queries.put`, `pond.control.bucket.configure`, `.drop`, `pond.control.table.put`, `.drop`, `.rebuild`, `pond.control.status`, `pond.ids.lease` | Tenants, users, named queries, tables, and ids for tenants, promotions, and problems |
+| pond | `pond.control.tenant.create`, `.suspend`, `.delete`, `pond.control.user.delete`, `pond.control.queries.put`, `pond.control.bucket.configure`, `.drop`, `pond.control.table.put`, `.drop`, `.rebuild`, `pond.control.events.put`, `.drop`, `pond.control.events.dead.*`, `pond.control.status`, `pond.ids.lease` | Tenants, users, named queries, tables, event cursors and dead events, and ids for tenants, promotions, and problems |
 | permit | `permit.control.realm.create`, `.suspend`, `.delete`, `permit.control.user.delete`, `permit.control.operator.*`, `permit.control.audit.read` | Realms, operators, and audit |
 | sun | `sun.control.schedule.put`, `.drop`, `sun.control.dead.*`, `sun.control.status` | Recurring schedules and the dead letter box |
 | barker | `barker.send`, `barker.control.domain.check`, `barker.control.dead.*` | Operator mail and test sends, sender domains, dead letters |
@@ -222,6 +266,10 @@ Wire codes are [network's](../common/NETWORK.md#codes). Operator calls map them 
 | `route.unbound_param` | An object uses a `{param}` the permit requirement doesn't bind. |
 | `route.overlap` | A route overlaps another without a traffic decision. |
 | `route.grant_refused` | Fork refused a grant or named query against the table versions. |
+| `route.event_loop` | An event route's service can write the bucket it listens to. |
+| `route.asset_unbound` | A route binds an asset name its box versions don't declare, or a prefix uses an unbound `{param}`. |
+| `route.egress_invalid` | An egress binding names an undeclared name, a non-https origin, an empty prefix, a missing spec, or a secret not sealed for barn. |
+| `secret.missing` | A route or service names a secret nobody has put. |
 | `table.drop_in_use` | A drop names a version a route still reads. |
 | `ramp.guardrail` | A ramp breached its guardrails and was rolled back. |
 | `apply.lagging` | A control apply to pond, permit, sun, or barker keeps failing. |
@@ -247,6 +295,15 @@ table Snapshot { seq: uint64; chunk: uint32; last: bool; objects: [ConfigEvent];
 
 union ConfigMessage { Snapshot, ConfigEvent, Reset }
 
+table Tool { name: string; summary: string; roles: [string]; changes: bool; input: [ubyte]; }   // input: JSON Schema
+table Caller { tenant: string; subject: string; kind: string; grants: [string]; }
+table ToolsList { caller: Caller; }
+table ToolsListAnswer { tools: [Tool]; roles: [RoleNode]; }
+table ToolCall { tool: string; args: [ubyte]; caller: Caller; }                 // args: JSON
+table ToolAnswer { result: [ubyte]; seq: uint64; widens: [string]; undo: [ubyte]; problems: [ubyte]; }
+
+table SealedSecret { name: string; for: [string]; fingerprint: string; sealed: [ubyte]; previous: [ubyte]; }
+
 table ProblemBatch { seq: uint64; service: string; host: string; problems: [homestead.problem.Problem]; }
 table HealthReport { seq: uint64; service: string; host: string; config_seq: uint64;
                      ready: [string]; window_ms: uint32; routes: [RouteCounts]; }
@@ -262,4 +319,6 @@ The model types (`Route`, `Service`, `Policy`, `Box`, `Domain`, `Table`) live in
 - **Production changes only by promotion,** and only a person approves one.
 - **Reports are acknowledged.** Problems and health counts are pushes resent until rancher has them.
 - **Rancher is the only caller of pond's, permit's, sun's, and barker's control APIs,** and every apply is idempotent.
-- **The operator API is never on the internet directly.** It is reached through barn's `http.serve` proxy.
+- **The operator tools are never on the internet directly.** Porch, inside barn, serves them, and rancher checks the caller's roles again on every call.
+- **Secrets cross the config log sealed,** only to the services allowed to open them; no tool answers a secret's value.
+- **An event route is checked like any other,** plus no loops, and lives in one environment.

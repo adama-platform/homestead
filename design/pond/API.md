@@ -21,6 +21,8 @@ Examples are written in flatc's JSON form of the FlatBuffers messages. Ids are i
 | `pond.wait` | call | barn, rancher | no | Whether tables reached a seq, and how far each got |
 | `pond.ids.lease` | call | barn, rancher, permit, sun, barker | yes | A range of fresh ids |
 | `pond.feed.subscribe` | stream | barn, rancher | no | Key changes and table progress, in seq order |
+| `pond.events.subscribe` | stream | barn | yes (leases) | Events for event routes, leased to this barn, as credit allows |
+| `pond.events.ack` | call | barn | yes | Events marked done, failed, or skipped |
 | `pond.outbox.lease` | stream | permit, sun, barker (Q12.1) | yes | Outbox elements addressed to the caller, under a lease |
 | `pond.outbox.ack` | call | permit, sun, barker (Q12.1) | yes | Elements marked delivered or dead |
 | `pond.deletions.subscribe` | stream | permit, sun, barker (Q12.2) | no | User and tenant deletions, in order |
@@ -30,7 +32,9 @@ Examples are written in flatc's JSON form of the FlatBuffers messages. Ids are i
 | `pond.control.queries.put` | call | rancher | yes | The named queries prepared |
 | `pond.control.bucket.configure`, `.drop` | call | rancher | yes | The bucket's state, or the drop's seq |
 | `pond.control.table.put`, `.drop`, `.rebuild` | call | rancher | yes | The table version's state |
-| `pond.control.status` | call | rancher | no | Per tenant: seq, sizes, table lag, WAL position |
+| `pond.control.events.put`, `.drop` | call | rancher | yes | The event route's cursor state |
+| `pond.control.events.dead.list`, `.redrive`, `.discard` | call | rancher | list no; others yes | Dead events, or how many were redriven or discarded |
+| `pond.control.status` | call | rancher | no | Per tenant: seq, sizes, table lag, event route lag, WAL position |
 
 `pond.control.tenant.resume` is the inverse of suspend; the IDEA's control table implies it. Every call except `get`, `query`, `wait`, `status`, and the subscriptions requires `Open.idempotency`.
 
@@ -91,6 +95,8 @@ The tenant in a payload is trusted only from barn or rancher (see [network](../c
 | effects | Outbox elements. `to` is `permit`, `sun`, or `barker`; `scope` orders elements per consumer (commit order within a scope); `body` is the consumer's own message, opaque to pond. |
 | hold | Answer once these tables applied the write, or at `timeout_ms`, saying which. A timeout is still `ok`, with `held: false`, and is reported as `pond.hold_timeout`. |
 | `Open.idempotency` | The write's key. A repeat answers the original seq. Barn uses the request id; sun's jobs use the job id. |
+
+Bucket names starting with `_` are refused with `invalid` unless the write comes from barn's system path (`system: true`, which barn sets only for `_credentials` writes it makes itself, never for a box's ops).
 
 Refusals: `invalid` (malformed patch, too many ops, a bucket name that breaks the name rules), `refused` with `pond.id_not_vended` (an id pond never leased out), `gone` with `pond.key_dead`, `conflict`, `refused` with `pond.tenant_suspended`, `overloaded` when the tenant's write queue is full.
 
@@ -178,6 +184,39 @@ Events, one per DATA message:
 
 Filters apply in pond: buckets (empty means all), then ids. Changes name keys, never contents. A `from` older than `_changes` keeps answers one `reset` and continues from now. A barn opens one subscription per tenant it caches and widens it by reopening; at most 1,024 ids per subscription.
 
+## Events: `pond.events.subscribe` and `pond.events.ack`
+
+Pond is the event bus: an event route is a tailer over `_changes` whose sink is a box (see [pond](IDEA.md#event-routes)). A barn opens one subscription across every tenant, and its credit is how many events it can run at once.
+
+```json
+{ "holder": "barn-7", "lease_ms": 30000 }
+```
+
+Events on the stream, one per message, as credit allows:
+
+```json
+{ "event": { "lease": "e-91f2", "tenant": "bobs_plumbing", "route": "order_placed",
+  "seq": 4472, "bucket": "orders", "id": 4294967312, "op": "merge", "user": 4294967311,
+  "at": 1762870000123, "attempt": 1 } }
+```
+
+```json
+{ "acks": [ { "lease": "e-91f2", "outcome": "done" },
+            { "lease": "e-91f3", "outcome": "failed", "reason": "box.trap" },
+            { "lease": "e-91f4", "outcome": "skipped", "reason": "route_not_live" } ] }
+```
+
+| field | meaning |
+| --- | --- |
+| route | The event route's name, as rancher put it. Barn resolves it to a service, export, objects, and grant from its own configuration. |
+| seq, bucket, id, op, user, at | The change: a key, never a document. |
+| lease | Held until acknowledged, `lease_ms` passes, or the stream closes; then the event goes to another barn. |
+| outcome | `done` moves the cursor; `failed` retries after a backoff (30 s, doubling, at most 10 minutes), dead after 5 attempts; `skipped` (the route isn't live here, the tenant is suspended) is done without running and is logged. |
+
+- **Order:** an event for (route, id) isn't handed out while an earlier one for the same route and id is leased or waiting. Different ids run in parallel.
+- **Idempotency:** the box's write carries `event:{route}:{seq}`, so a redelivery can't write twice.
+- **A dead event** is raised as `pond.event_dead` with the route, key, seq, and every attempt's reason, and waits for rancher.
+
 ## The service API
 
 ### The outbox (assuming Q12.1's lean: each consumer drains its own slice)
@@ -248,6 +287,13 @@ Only rancher. Every call is idempotent by key and by content, so rancher can alw
 | `table.rebuild` | `{ tenant, table, version }` | `{ state: "building" }` |
 | `status` | `{ tenant? }` | `{ tenants: [{ tenant, seq, buckets, documents, bytes, tables: [{ table, applied, lag }], wal_position }] }` |
 
+| `events.put` | `{ tenant?, name, bucket, ops: ["merge", "delete"], start: "now" or "beginning" }` | `{ name, cursor }`; the same definition again is `ok`; a changed `bucket` or `ops` under the same name is `conflict` |
+| `events.drop` | `{ tenant?, name }` | `{ state: "dropped" }`; leased events finish, nothing new is handed out |
+| `events.dead.list` | `{ tenant, name?, limit, after? }` | `{ dead: [{ name, seq, bucket, id, op, attempts: [{ holder, at, reason }] }], next }` |
+| `events.dead.redrive`, `.discard` | `{ tenant, name, seqs? }` (no seqs: all) | `{ count }` |
+
+`events.put` with `start: "beginning"` replays what `_changes` still holds; older history is not replayed. On promotion, rancher moves an event route from beta's shadow to production without a new cursor, so it neither misses nor repeats changes.
+
 `table.put` with a definition that differs from an existing version of the same number is `conflict` with `pond.table_version_changed`: a new shape is a new version.
 
 ## Central types
@@ -279,6 +325,13 @@ table Progress { table: string; applied: long; }
 table Reset { oldest: long; }
 union FeedBody { Change, Progress, Reset }
 table FeedEvent { seq: long; body: FeedBody; }
+
+enum EventOutcome : ubyte { done, failed, skipped }
+table Event {
+  lease: string; tenant: string; route: string;
+  seq: long; bucket: string; id: long; op: OpKind; user: long; at: long; attempt: uint16;
+}
+table EventAck { lease: string; outcome: EventOutcome; reason: string; }
 ```
 
 ## Problem codes pond raises
@@ -294,6 +347,7 @@ table FeedEvent { seq: long; body: FeedBody; }
 | `tailer.type_mismatch`, `tailer.behind` | A document doesn't fit a column; a tailer can't keep up. |
 | `pond.outbox_dead`, `pond.outbox_stuck` | An element was dead-lettered; an element has waited past its deadline. |
 | `pond.replica_lag`, `pond.replica_epoch_stale` | The chain is slow; a stale head pushed. |
+| `pond.event_dead`, `pond.event_behind` | An event ran out of attempts; an event route's cursor is falling behind its bucket. |
 | `pond.deletions_reset` | A deletion subscriber fell behind the kept log. |
 | `fork.*` | Passed through from fork's refusal catalog. |
 
@@ -303,5 +357,7 @@ table FeedEvent { seq: long; body: FeedBody; }
 - **A write answered `ok` has been fsynced, and replicated when it carries effects.**
 - **The tenant comes from barn or rancher.** The service API never takes one from its caller.
 - **Feeds name keys, never contents,** and a gap is a `reset`.
+- **Pond is the event bus.** Event routes are tailers whose sink is a box; every matching change is leased to one barn at a time until done, skipped, or dead.
+- **Boxes never write `_` buckets.** Only barn's own system writes reach `_credentials`.
 - **Only rancher calls `pond.control.*`; only pond calls `pond.replica.*`.**
 - **Queries carry their grant.** Pond stores none, and runs only fork's output.

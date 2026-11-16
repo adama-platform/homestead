@@ -1,0 +1,192 @@
+{
+	"info": {
+		"name": "HEVY through hound",
+		"description": "Validates hound against the HEVY public API (a Pro feature). Every live item runs through the `hevy` binding exactly as a box would, so the api-key header is attached by hound, never by the item. Field names in expectations are from HEVY's API docs as best understood; verify against https://api.hevyapp.com/docs before relying on them.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"auth": {
+		"type": "apikey",
+		"apikey": [
+			{ "key": "key", "value": "api-key", "type": "string" },
+			{ "key": "value", "value": "{{hevy_api_key}}", "type": "string" },
+			{ "key": "in", "value": "header", "type": "string" }
+		]
+	},
+	"variable": [
+		{ "key": "base", "value": "https://api.hevyapp.com" },
+		{ "key": "page_size", "value": "5" }
+	],
+	"hound": {
+		"egress": {
+			"hevy": {
+				"origin": "https://api.hevyapp.com",
+				"prefixes": ["/v1/"],
+				"methods": ["GET", "POST", "PUT"],
+				"credential": { "kind": "api-key", "header": "api-key", "secret": "tenant/hevy_api_key" },
+				"rate": "10/s"
+			}
+		}
+	},
+	"item": [
+		{
+			"name": "read",
+			"item": [
+				{
+					"name": "workout count",
+					"request": { "method": "GET", "url": "{{base}}/v1/workouts/count" },
+					"hound": {
+						"binding": "hevy",
+						"expect": {
+							"status": 200,
+							"json": [{ "path": "$.workout_count", "op": "type", "value": "integer" }]
+						}
+					}
+				},
+				{
+					"name": "recent workouts",
+					"request": { "method": "GET", "url": "{{base}}/v1/workouts?page=1&pageSize={{page_size}}" },
+					"hound": {
+						"binding": "hevy",
+						"expect": {
+							"status": 200,
+							"json": [
+								{ "path": "$.page", "op": "eq", "value": 1 },
+								{ "path": "$.page_count", "op": "type", "value": "integer" },
+								{ "path": "$.workouts", "op": "type", "value": "array" },
+								{ "path": "$.workouts[0].id", "op": "exists" },
+								{ "path": "$.workouts[0].exercises", "op": "type", "value": "array" }
+							]
+						},
+						"capture": { "workout_id": "$.workouts[0].id" }
+					}
+				},
+				{
+					"name": "one workout",
+					"request": { "method": "GET", "url": "{{base}}/v1/workouts/{{workout_id}}" },
+					"hound": {
+						"binding": "hevy",
+						"expect": {
+							"status": 200,
+							"json": [
+								{ "path": "$.id", "op": "eq", "value": "{{workout_id}}" },
+								{ "path": "$.title", "op": "type", "value": "string" }
+							]
+						}
+					}
+				},
+				{
+					"name": "workout events since a date",
+					"request": { "method": "GET", "url": "{{base}}/v1/workouts/events?page=1&pageSize={{page_size}}&since=2024-01-01T00:00:00Z" },
+					"hound": {
+						"binding": "hevy",
+						"expect": {
+							"status": 200,
+							"json": [{ "path": "$.events", "op": "type", "value": "array" }]
+						}
+					}
+				},
+				{
+					"name": "routines",
+					"request": { "method": "GET", "url": "{{base}}/v1/routines?page=1&pageSize={{page_size}}" },
+					"hound": {
+						"binding": "hevy",
+						"expect": {
+							"status": 200,
+							"json": [{ "path": "$.routines", "op": "type", "value": "array" }]
+						}
+					}
+				},
+				{
+					"name": "routine folders",
+					"request": { "method": "GET", "url": "{{base}}/v1/routine_folders?page=1&pageSize={{page_size}}" },
+					"hound": {
+						"binding": "hevy",
+						"expect": {
+							"status": 200,
+							"json": [{ "path": "$.routine_folders", "op": "type", "value": "array" }]
+						}
+					}
+				},
+				{
+					"name": "exercise templates",
+					"request": { "method": "GET", "url": "{{base}}/v1/exercise_templates?page=1&pageSize={{page_size}}" },
+					"hound": {
+						"binding": "hevy",
+						"expect": {
+							"status": 200,
+							"json": [
+								{ "path": "$.exercise_templates", "op": "len_gte", "value": 1 },
+								{ "path": "$.exercise_templates[0].id", "op": "exists" }
+							]
+						},
+						"capture": { "exercise_template_id": "$.exercise_templates[0].id" }
+					}
+				}
+			]
+		},
+		{
+			"name": "writes",
+			"hound": { "writes": true },
+			"item": [
+				{
+					"name": "create a routine",
+					"request": {
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/json" }],
+						"url": "{{base}}/v1/routines",
+						"body": {
+							"mode": "raw",
+							"raw": "{\n  \"routine\": {\n    \"title\": \"hound test routine\",\n    \"folder_id\": null,\n    \"notes\": \"Created by hound's HEVY cases. Safe to delete.\",\n    \"exercises\": [\n      {\n        \"exercise_template_id\": \"{{exercise_template_id}}\",\n        \"superset_id\": null,\n        \"rest_seconds\": 90,\n        \"notes\": \"\",\n        \"sets\": [{ \"type\": \"normal\", \"weight_kg\": null, \"reps\": 10 }]\n      }\n    ]\n  }\n}",
+							"options": { "raw": { "language": "json" } }
+						}
+					},
+					"hound": {
+						"binding": "hevy",
+						"writes": true,
+						"expect": { "status": [200, 201] }
+					}
+				}
+			]
+		},
+		{
+			"name": "policy",
+			"description": "Each item must be refused by hound_policy with the named code, and nothing may be sent.",
+			"item": [
+				{
+					"name": "path outside the prefix",
+					"request": { "method": "GET", "url": "{{base}}/v2/workouts" },
+					"hound": { "binding": "hevy", "expect": { "refused": "policy.path_outside_prefix" } }
+				},
+				{
+					"name": "dot segments",
+					"request": { "method": "GET", "url": "{{base}}/v1/../admin" },
+					"hound": { "binding": "hevy", "expect": { "refused": "policy.path_ambiguous" } }
+				},
+				{
+					"name": "encoded dot segments",
+					"request": { "method": "GET", "url": "{{base}}/v1/%2e%2e/admin" },
+					"hound": { "binding": "hevy", "expect": { "refused": "policy.path_ambiguous" } }
+				},
+				{
+					"name": "the box sets the credential's header",
+					"request": {
+						"method": "GET",
+						"header": [{ "key": "api-key", "value": "not-yours" }],
+						"url": "{{base}}/v1/workouts/count"
+					},
+					"hound": { "binding": "hevy", "expect": { "refused": "policy.header_reserved" } }
+				},
+				{
+					"name": "method not allowed",
+					"request": { "method": "DELETE", "url": "{{base}}/v1/routines/1" },
+					"hound": { "binding": "hevy", "expect": { "refused": "policy.method_not_allowed" } }
+				},
+				{
+					"name": "origin swap by absolute URL",
+					"request": { "method": "GET", "url": "https://hevy.example.net/v1/workouts" },
+					"hound": { "binding": "hevy", "expect": { "refused": "policy.absolute_url" } }
+				}
+			]
+		}
+	]
+}

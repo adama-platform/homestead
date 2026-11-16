@@ -174,7 +174,7 @@ Every control call is rancher's, so operators and agents reach barker through ra
 }
 ```
 
-- **`domain.put`** registers a sending domain for a tenant, generates its DKIM key (by reference to the key store), and answers the records to publish. **`domain.check`** reads DNS now and answers findings; barker also rechecks every verified domain daily, and a domain that stops verifying is a problem.
+- **`domain.put`** registers a sending domain for a tenant, generates its DKIM key pair, seals the private half with [cellar](../cellar/IDEA.md) and stores it as the secret `tenant/{tenant}/dkim/{domain}` through rancher (barker never keeps plaintext at rest), and answers the records to publish. **`domain.check`** reads DNS now and answers findings; barker also rechecks every verified domain daily, and a domain that stops verifying is a problem.
 - **`dead.list`** pages dead letters by tenant, template, and reason, with every attempt; rendered bodies are gone after 7 days. **`dead.redrive`** and **`dead.discard`** take message ids or a filter, and a dry run.
 - **`suppression.lookup`** takes an address, hashes it, and answers the categories and the reason (`hard-bounce` on a date). **`suppression.remove`** is an operator overriding a suppression, audited with who and why; a complaint can't be removed by a tenant's own operator.
 
@@ -212,7 +212,7 @@ Result<Claims> verify(const KeyRing&, std::string_view domain, std::string_view 
 
 - **The domain is in the MAC**, so a token can't be moved to another tenant's domain.
 - **A token reaches one route.** Barn refuses a token whose `route` isn't the mail route the address matched.
-- **Keys come from rancher's config log** (by reference to the key store), current and previous, so rotation never breaks a reply in flight.
+- **Keys come from rancher's config log** (sealed secrets, opened with [cellar](../cellar/IDEA.md)), current and previous, so rotation never breaks a reply in flight.
 - **Verification is constant time**, and a failure says only "invalid," never which part.
 
 ## Central types

@@ -235,3 +235,55 @@ Each question has a **lean**: what the docs currently assume if nobody answers. 
 *Lean:* only a host operator, never the tenant's own operator, since a complaint is the recipient's word.
 
 **Answer:**
+
+## 13. Events, assets, egress, tools, secrets, and deploys
+
+These came out of the 2026-11-16 decisions recorded in [HOLES.md](HOLES.md): pond as the event bus, silo in barn, and hound, porch, cellar, and farmhand.
+
+### Q13.1 Event routes: loops, replay, and retries
+*Source:* pond/IDEA.md, rancher/IDEA.md, barn/IDEA.md. An event route whose box writes the bucket it listens to can loop; a new route with `start: "beginning"` can only replay what `_changes` still keeps.
+*Lean:* rancher refuses a route listening to a bucket its own service writes, unless `"self-writes": true`; replay covers only the kept window, never full history; retries back off from 30 s, doubling to 10 minutes, dead after 5 attempts, as sun does.
+
+**Answer:**
+
+### Q13.2 Event routes in beta
+*Source:* pond/IDEA.md, rancher/IDEA.md. Beta and production read the same data, so both would see every write.
+*Lean:* an event route is live in one environment; a beta-only one runs as a shadow (merges recorded, discarded) until promoted, and promotion hands it the production cursor.
+
+**Answer:**
+
+### Q13.3 Assets that outlive their write
+*Source:* barn/IDEA.md. A silo `put` or an attachment lands in S3 before the pond write, so a failed write leaves an object; a presigned upload skips barn's type sniffing; a deleted user's objects under `{!user_id}` prefixes aren't swept by anyone but the box.
+*Lean:* accept all three: objects first and their reference in the pond write, boxes sweep (their decision, as the author asked), boxes `head` a presigned upload before adopting it. Open: should a user's deletion also delete every asset prefix bound to `{!user_id}`, since that is a privacy promise, not housekeeping?
+
+**Answer:**
+
+### Q13.4 Hound: rates across barns and OAuth endpoints
+*Source:* hound/IDEA.md, barn/IDEA.md. A binding's `rate` is per deployment, but every barn sends; an `oauth2-user` binding needs authorize and token URLs and scopes; the connect callback can land on a different barn.
+*Lean:* each barn takes a share of the rate, rebalanced from rancher's view of live barns; the binding carries `authorize-url`, `token-url`, and `scopes`; the OAuth state rides a sealed cookie so any barn can finish the flow; `http://` origins only behind a dev deployment flag.
+
+**Answer:**
+
+### Q13.5 Hound's test cases: Postman only?
+*Source:* hound/IDEA.md, hound/cases/. Hound reads Postman Collection v2.1 with its assertions under a `hound` key; Postman's JavaScript tests are skipped.
+*Lean:* Postman now; Hurl and `.http` imports later, only if a real suite wants them. Crawling politeness (robots.txt) waits for a crawler product.
+
+**Answer:**
+
+### Q13.6 Porch: who may delegate, and sessions
+*Source:* porch/IDEA.md, permit/IDEA.md. A lead agent mints narrower sub-agent tokens; MCP sessions live in one barn's memory.
+*Lean:* only `admin` and `deploy` may delegate, at most 3 deep, for at most 24 hours, revoked with their parent; sessions aren't pinned, so a client that lands on another barn reinitializes; catalogs are the same for every tenant for now; the owner's panel is a store site calling `/_ops/api`.
+
+**Answer:**
+
+### Q13.7 Cellar: where secrets are sealed, and key scope
+*Source:* cellar/IDEA.md, rancher/IDEA.md. Rancher seals and stores; it never opens. Sealing in barn instead (where porch receives `secret_put`) would mean rancher never sees plaintext at all.
+*Lean:* seal in barn, and rancher verifies the envelope's shape before storing it; one wrap key per deployment; backups seal to a second, offline key whose private half is on no server; fingerprints are keyed hashes; only a person sets a secret, agents see metadata. Open: who re-seals pond's `_credentials` when the wrap key rotates?
+
+**Answer:**
+
+### Q13.8 Farmhand: language, scope, and agents
+*Source:* farmhand/IDEA.md.
+*Lean:* C++20 with a pure planner tested against a fake host, speaking JSON lines to its agent over SSH; one host per command plus `--all` in inventory order; agents may run `plan` and `audit` with a restricted key and nothing else; the deployment CA lives on the operator's machine and needs its own sealed backup.
+
+**Answer:**

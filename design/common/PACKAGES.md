@@ -122,6 +122,9 @@ A library package is code another service runs in its own process, which is the 
 | `store_plan` | store | barn | Barn executes the page plans store compiles; the format must be one definition. |
 | `rancher_model` | rancher | barn, store | Routes, services, and policies as data, so barn's routing and rancher's checks read one definition. |
 | `common_mustache` | common | store, barker, barn | One template engine, one escaping rule. |
+| `cellar_*` | cellar | barn, permit, barker, pond, ranger; rancher (seal only) | Secrets are sealed in rancher and opened at the moment of use with the host's vault key; a network hop for a plaintext secret would be a worse boundary. See [cellar](../cellar/PACKAGES.md). |
+| `hound_*` | hound | barn, and the `hound` CLI | A box's outbound call runs on its request, under its deadline and its route's grant. See [hound](../hound/PACKAGES.md). |
+| `porch_*` | porch | barn | Operator tools belong to the services that implement them; porch only gathers, filters by role, and speaks MCP at barn's door. See [porch](../porch/PACKAGES.md). |
 
 The owner of a library is the only team that changes it, and a change to one is reviewed at the higher of its own tier and its linker's. A library's QUALITY.md lists who links it.
 
@@ -144,7 +147,7 @@ The owner of a library is the only team that changes it, and a change to one is 
 | `common_mustache` | `homestead::common::mustache` | Mustache, escaping by default, no partials (components are a store concept) | R1 |
 | `common_test` | `homestead::common::test` | Temp directories, ephemeral ports, a fault-injecting filesystem, a manual clock harness. Test-only. | R3 |
 
-Third-party code, all mainstream: Boost (Asio, Beast, JSON), SQLite 3, OpenSSL 3, FlatBuffers, GoogleTest, and per service: wasmtime (barn), RE2 and zstd (ranger), md4c (store). Each is wrapped by one package, which is the only one that includes it.
+Third-party code, all mainstream: Boost (Asio, Beast, JSON), SQLite 3, OpenSSL 3, FlatBuffers, GoogleTest, and per service: wasmtime (barn), RE2 and zstd (ranger), md4c (store). hound needs a YAML parser for OpenAPI (yaml-cpp). Each is wrapped by one package, which is the only one that includes it.
 
 ## How everything connects
 

@@ -29,6 +29,7 @@ Pond owns everything about data. Connections, transactions, durability, ordering
    |   _documents   (bucket, id) -> doc, seq                    |
    |   _names       string -> id                                |
    |   _changes     seq, bucket, id, op, user --> pubsub feed   |
+   |   _events      a cursor per event route --> boxes, by barn |
    |   _outbox      effects committed with a write, until done  |
    |   tables       name@version, tailed from 1+ buckets        |
    +------------------------------------------------------------+
@@ -44,6 +45,7 @@ Pond owns everything about data. Connections, transactions, durability, ordering
 | The documents | `_documents`: the current fold of every MERGE per bucket and id | Reading a key gives the result of every acknowledged write to it, in order. |
 | A tailer | A projection from one or more buckets into one versioned SQLite table | The table is a function of the documents, and can be rebuilt at any time. |
 | The feed | The tenant's change log: which keys changed, in order | A subscriber sees every change once, in seq order, or learns it fell behind. |
+| An event tailer | A cursor over the change log whose sink is a box, run by barn on an event route | Every matching change reaches the route at least once, in seq order per id, or ends dead and is a problem. |
 | The id service | The counter, the ranges it vends, and each tenant's names | An id is minted once; a name always means the same id while it is bound. |
 | The outbox | Effects on other services (a grant, a schedule, a mail), committed in the same write as the data | An effect exists if and only if its write landed, and is delivered at least once. |
 
@@ -54,6 +56,7 @@ A bucket is a name in one tenant, like `profiles` in `bobs_plumbing`. It is a ro
 - **A bucket exists once it is written or configured.** A write to a bucket the tenant doesn't have yet creates it, in the same WAL record. Barn only writes buckets a box's write ruleset names (see barn), so the ruleset is the gate, not a creation step.
 - **A bucket has no schema.** A schema is a promise about the writers, and pond only promises things about the writes. Shape lives in tailer definitions, where it can change without touching a document.
 - **Dropping a bucket is one write.** Its documents are deleted in the background; its name is tombstoned.
+- **Names starting with `_` are reserved.** A box or route can never name one. `_credentials` is the first: per-user OAuth tokens and the like, sealed by [cellar](../cellar/IDEA.md) and written only by barn as a system write, keyed by user id and egress name, so they are deleted with their user like everything else.
 - **A bucket has a kind.** `document` is the first and only kind to start. `log` (append-only events) and `cache` (a time to live, not in the WAL) are candidates for later. Timers are not a bucket kind; they belong to [sun](../sun/IDEA.md).
 
 ## Keys: buckets share ids
@@ -272,6 +275,40 @@ feed.subscribe { tenant: bobs_plumbing, buckets: [jobs], ids: [4294967312], from
 - **Tables report progress.** A subscriber can ask for table progress too, which is how barn learns a cached query answer is stale and when a held response can go.
 - **Resuming is by seq.** `_changes` is kept for a window, and a subscriber asking for a seq older than the window gets a `reset`, which tells it to drop everything it cached and start from now.
 
+## Event routes
+
+Pond is the event bus. A write already lands in `_changes` with its seq, bucket, id, op, and user, in the one order the tenant has; that log is change data capture, and change data capture is all a bus would carry. So homestead has no second bus. A box that wants to react to data ("when an order lands, reserve the stock") listens to pond through an **event route**, and pond runs it with the same machinery it uses for tables: a tailer with a cursor, whose sink is a box instead of a SQLite table.
+
+```json
+{
+	"route": "event order_placed",
+	"service": "fulfilment",
+	"export": "on_order",
+	"on": { "bucket": "orders", "ops": ["merge"] },
+	"objects": {
+		"order": { "bucket": "orders", "id": "{event.id}", "access": "read" },
+		"stock": { "bucket": "reservations", "id": "{event.id}", "access": "merge" }
+	}
+}
+```
+
+| piece | how it works |
+| --- | --- |
+| Definition | Rancher applies an event route's `on` to pond with `pond.control.events.put` (name, bucket, ops, and whether to start from now or from the beginning of `_changes`). Pond knows nothing else about it: not the box, the objects, or the grant. |
+| Cursor | One per tenant per event route, in the tenant's `_events` table, beside the table tailers' cursors in `_cursors`. It moves only when the events before it are done, failed out, or skipped. |
+| Delivery | Barns subscribe with `pond.events.subscribe`, across tenants, offering credit for how many events they can run at once, exactly like sun's timer events. Pond leases each event to one barn (30 seconds by default); barn runs the route and acknowledges `done`, `failed`, or `skipped`. A lease that expires goes to another barn. |
+| Order | Per event route and id, in seq order: the second change to `orders/42` isn't handed out until the first is acknowledged. Different ids run in parallel. |
+| Retries | `failed` makes the event due again after a backoff; after 5 attempts it is dead, kept with its attempts, and raised as `pond.event_dead`. Rancher can list, redrive, and discard dead events. |
+| Contents | An event names a key, never a document: `{seq, bucket, id, op, user, at}`. The route's objects bind `{event.id}` and `{event.user}`, and barn loads what the box needs, so an event can't carry a field the route wasn't granted. |
+| Exactly-once effects | The box's pond write carries the idempotency key `event:{route}:{seq}`, so a redelivered event can't apply its write twice. Delivery is at least once; effects are at most once, as with sun. |
+
+Two rules keep events from becoming a tangle, and rancher enforces both when a route is put (see [rancher](../rancher/IDEA.md#event-routes)):
+
+- **No loops.** An event route whose service's box versions can write the bucket it listens to is refused, so a route can't feed itself. Chains across buckets (orders -> reservations -> shipments) are allowed and show up as one widening in the promotion diff.
+- **One environment.** Beta and production share the tenant's data, so both would see every write. An event route is live in exactly one environment: a new beta event route runs as a shadow (its merges recorded and discarded) until it is promoted, and on promotion it takes over the production cursor.
+
+SSE stays on the feed: a client watching one job is a feed subscription filtered by id, and nothing needs to be acknowledged. Event routes are for work that must happen once per change, even if every barn restarts.
+
 ## The outbox
 
 A request can do more than write data: it can grant a role in permit, schedule a job in sun, or send mail through barker. Those are other services, and they don't share a transaction with pond. Goober's answer was the outbox, and homestead keeps it: **an effect is written into pond in the same write as the data**, so it exists if and only if the write landed.
@@ -324,6 +361,8 @@ Pond's control API manages `_pond.db`, and only rancher calls it.
 | queries put | Prepares a route's named queries, already checked by fork in rancher. |
 | bucket configure, drop | Sets a bucket's kind and retention, or drops it with one write. |
 | table put, drop, rebuild | Defines a table version from one or more buckets, builds it, drops it. |
+| events put, drop | Defines an event route's cursor (name, bucket, ops, start), or removes it. |
+| events dead list, redrive, discard | Reads and handles events that ran out of attempts. |
 | status | Per tenant: seq, buckets, documents, bytes, each table's lag, the WAL position. |
 
 ## Scale
@@ -335,7 +374,8 @@ A tenant is bound to one machine, and that is the plan, not a stage: these produ
 - **Not a SQL write path.** Writes are MERGE and DELETE on keys. SQL reads tables.
 - **Not a schema registry.** Shapes live in table versions, and a new shape is a new version.
 - **Not an authority on who may do what.** Routing decides which keys a box may write and which tables it may read; permit decides who a caller is. Pond trusts barn and rancher.
-- **Not a place for blobs.** Large files go to object storage, and a document holds a reference.
+- **Not a place for blobs.** Files live in S3, under prefixes barn's routes grant (see [barn](../barn/IDEA.md)); a document holds a key. Pond never stores or serves asset bytes.
+- **Not a second bus.** Events are changes in `_changes`, delivered by event tailers; there is no separate topic system.
 - **Not stateful for its readers.** No sessions, cursors, or open transactions survive a call.
 
 ## Inspirations
@@ -349,6 +389,7 @@ A tenant is bound to one machine, and that is the plan, not a stage: these produ
 | Goober's outbox | Effects committed with the data, delivered at least once with stable keys. |
 | Chain replication | Durability for the bundle of effects, without a consensus protocol. |
 | Kafka compacted topics | A change log keyed by key, consumed from an offset. |
+| Change data capture (Debezium) | The database's own log as the event stream, so events can't disagree with the data. |
 | Entity-component systems | One id, many facets, each stored and changed on its own. |
 
 ## Open questions
@@ -368,4 +409,6 @@ A tenant is bound to one machine, and that is the plan, not a stage: these produ
 - **Every wait is bounded.** And a wait that keeps timing out is a problem someone sees.
 - **Only rancher calls the control API.**
 - **Every write names its user.** 0 for the system or tenant; deleting a user deletes what was written for them.
+- **Pond is the event bus.** Event routes are tailers whose sink is a box: a cursor per route, at least once, in seq order per id, dead after their attempts and raised as a problem.
+- **Names starting with `_` are reserved.** No box or route names `_credentials` or any other system bucket.
 - **An effect exists if and only if its write landed.** Effects are committed with the data, chain-replicated before acknowledgment, and delivered at least once by barn.

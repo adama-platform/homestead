@@ -21,7 +21,7 @@ Store holds a tenant's site and compiles it into releases. Barn serves releases.
 | barn | Serving: barn pulls compiled releases by hash and renders them | Barn subscribes to rancher's config log, which names releases; it fetches each one from store once and caches it forever. |
 | rancher | Every release becomes routes on the tenant's domains, under the `site` service | Store submits a release's routes, grants, and named queries; rancher checks them like any other routes. |
 | pond | Nothing directly | `.shtml` queries run through barn, under a grant rancher approved. |
-| agents, operators | Writing, previewing, linting, and releasing | MCP tools and the operator API, proxied through barn like rancher's. |
+| agents, operators | Writing, previewing, linting, and releasing | Store's tools, tagged with roles, served by [porch](../porch/IDEA.md) in barn as MCP at `/mcp/content` (and the other role paths) and as HTTP at `/_ops/api/{tool}`. |
 
 Store is one machine with its own SQLite database for files, versions, and releases, plus a blob directory (S3-shaped, as in goober) for content-addressed bytes. It never sees a visitor's request.
 

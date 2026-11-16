@@ -21,7 +21,7 @@ So the R0 packages are exactly those two fences, cut small: `ranger_record` (val
 | `ranger_segment` | `homestead::ranger::segment` | Hourly segment files per stream: append, fsync, close, compress with zstd, rewrite for a purge | `common_core`, zstd | R1 |
 | `ranger_index` | `homestead::ranger::index` | Per-segment index by time, tenant, request, and route; dedupe high-water marks per stream | `common_sqlite`, `ranger_segment` | R1 |
 | `ranger_search` | `homestead::ranger::search` | Search, trace, and count: index lookups, then a bounded scan with RE2; bytes, time, and limit stops | `ranger_index`, `ranger_segment`, `ranger_scope`, RE2 | R1 |
-| `ranger_archive` | `homestead::ranger::archive` | Seal a closed day with the backup key, write its manifest (first and last seq, chains, counts, hash), store it, age it out | `common_blob`, `common_crypto`, `ranger_segment` | R1 |
+| `ranger_archive` | `homestead::ranger::archive` | Seal a closed day with the backup key (from cellar), write its manifest (first and last seq, chains, counts, hash), store it, age it out | `common_blob`, `common_crypto`, `ranger_segment` | R1 |
 | `ranger_audit` | `homestead::ranger::audit` | Write an `audit` line for every read, purge, and gap, through ranger's own `common_log` | `common_log` | R1 |
 | `ranger_ingest` | `homestead::ranger::ingest` | The ingest pipeline: record check, dedupe, chain, append, ack durable seqs | `ranger_record`, `ranger_chain`, `ranger_segment`, `ranger_index`, `ranger_audit` | R1 |
 | `ranger_tail` | `homestead::ranger::tail` | Live fan-out of ingested lines to tail streams, with filters, rate caps, and dropped counts | `ranger_scope` | R2 |

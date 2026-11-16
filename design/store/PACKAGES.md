@@ -14,7 +14,7 @@ The plan format barn executes is a library, `store_plan`, so there is one defini
 
 | package | namespace | does | depends on | tier |
 | --- | --- | --- | --- | --- |
-| `store_proto` | `homestead::store::proto` | The `.fbs` schema and generated code for `release.fetch` and `http.serve` | `common_wire` | R3 |
+| `store_proto` | `homestead::store::proto` | The `.fbs` schema and generated code for `release.fetch`, `tools.list`, `tools.call` (with `porch_contract`'s types), and `http.serve` for upload tickets | `common_wire`, `porch_contract` | R3 |
 | `store_plan` | `homestead::store::plan` | **Library.** The release format: pages, parts, segments, slots, blobs; build and read. Linked by barn. | `common_core` | R1 |
 | `store_db` | `homestead::store::db` | Store's SQLite: files and their versions, stages, releases, attachments; blobs by hash in `common_blob` | `common_sqlite`, `common_blob` | R2 |
 | `store_tree` | `homestead::store::tree` | Paths, file kinds, URL rules (`_` never served, `index`, one URL one file, `.md` redirects) | `common_core` | R1 |
@@ -28,8 +28,8 @@ The plan format barn executes is a library, `store_plan`, so there is one defini
 | `store_lint` | `homestead::store::lint` | Consistency: chrome copies, repeated markup, theme drift, orphans, page lint | `store_tree`, `store_plan` | R2 |
 | `store_release` | `homestead::store::release` | Snapshot, canonical bytes and hash, diff in plain words, submit and propose | `store_compile`, `store_guard`, `store_db`, `rancher_client` | R1 |
 | `store_attach` | `homestead::store::attach` | Attachments: fetch by URL, upload tickets, sniff types from bytes, numbering, usage | `store_db`, `common_http` | R1 |
-| `store_tools` | `homestead::store::tools` | Tool handlers: `if_etag`, dry run, stage and apply, render with overlays, findings | most core packages | R2 |
-| `store_server` | `homestead::store::server` | Binds `release.fetch` and `http.serve`, checks the caller is barn | `store_proto`, `store_tools`, `store_db` | R2 |
+| `store_tools` | `homestead::store::tools` | Implements the tools contract: the catalog with each tool's roles, the role re-check with `porch_roles` on every call, and the handlers: `if_etag`, dry run, stage and apply, render with overlays, findings | most core packages, `porch_contract`, `porch_roles` | R1 |
+| `store_server` | `homestead::store::server` | Binds `release.fetch`, `tools.list`, `tools.call`, and `http.serve` (upload tickets only), checks the caller is barn | `store_proto`, `store_tools`, `store_attach`, `store_db` | R2 |
 | `store_client` | `homestead::store::client` | The `Store` interface and its wire implementation | `store_proto`, `common_wire` | R2 |
 | `store_fake` | `homestead::store::fake` | An in-memory store serving releases built in the test | `store_client`, `store_plan` | R2 |
 | `store_system` | `homestead::store::system` | The composition root | everything above | R2 |
@@ -101,6 +101,11 @@ The plan format barn executes is a library, `store_plan`, so there is one defini
 - **Tests.** Diff completeness on generated pairs; resubmitting is idempotent.
 - **Won't.** Promote; it proposes.
 
+### store_tools (R1)
+- **Promise.** Every tool is in the catalog with its roles; every call is re-checked with `porch_roles` before a handler runs; every changing tool takes `dry_run` and every edit `if_etag`; a stage applies all or nothing.
+- **Tests.** The contract test suite from `porch_fake` against store's source; a role-path call for a tool outside that role refused even when porch forwards it; dry runs change nothing.
+- **Won't.** Verify tokens (barn did), or decide content rules (`store_guard`, `store_lint`).
+
 ### store_attach (R1)
 - **Promise.** An attachment's type comes from its bytes, never its name; tickets are one-time and expire; an attachment in use isn't deleted without `force`.
 - **Tests.** Polyglot files, mismatched extensions, oversized uploads, expired tickets.
@@ -119,8 +124,8 @@ The plan format barn executes is a library, `store_plan`, so there is one defini
 | tier | packages |
 | --- | --- |
 | R0 | `store_guard`, `store_ssi` |
-| R1 | `store_plan`, `store_compile`, `store_release`, `store_component`, `store_query`, `store_tree`, `store_attach` |
-| R2 | `store_tools`, `store_lint`, `store_db`, `store_frontmatter`, `store_markdown`, `store_server`, `store_client`, `store_fake`, `store_system` |
+| R1 | `store_plan`, `store_compile`, `store_release`, `store_component`, `store_query`, `store_tree`, `store_attach`, `store_tools` |
+| R2 | `store_lint`, `store_db`, `store_frontmatter`, `store_markdown`, `store_server`, `store_client`, `store_fake`, `store_system` |
 | R3 | `store_proto`, `store_main` |
 
 Build order, so agents can work in parallel:
@@ -129,7 +134,7 @@ Build order, so agents can work in parallel:
 2. In parallel: `store_ssi`, `store_guard`, `store_tree`, `store_frontmatter`, `store_markdown`, `store_db`, `store_client` + `store_fake`.
 3. In parallel: `store_component`, `store_query` (needs `fork_api`), `store_attach`.
 4. `store_compile`, then `store_lint` and `store_release` (needs `rancher_fake`).
-5. `store_tools`, `store_server`, `store_system`, `store_main`.
+5. `store_tools` (needs `porch_roles` and `porch_contract`), `store_server`, `store_system`, `store_main`.
 
 ## The invariants
 

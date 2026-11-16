@@ -28,7 +28,7 @@ Profile data (names, avatars, addresses) is not permit's. It lives in pond bucke
 
 ## Storage
 
-Permit keeps one SQLite database for every realm, apart from pond, so identity can be backed up, audited, and secured on its own. Every row is keyed by realm, so one realm can be exported, moved, or deleted along with its tenant. Every row about a user is keyed by their id too, so deleting a user (see [tenants](../common/TENANT.md#deletion)) removes their credentials, sessions, grants, and tokens; the audit keeps that the deletion happened. Permit leases id ranges from pond for user ids, so a user's id is unique everywhere and is a natural key in every bucket.
+Permit's private signing keys are not in that database: they are held through [cellar](../cellar/IDEA.md), the vault library, and loaded into memory only to sign. Permit keeps one SQLite database for every realm, apart from pond, so identity can be backed up, audited, and secured on its own. Every row is keyed by realm, so one realm can be exported, moved, or deleted along with its tenant. Every row about a user is keyed by their id too, so deleting a user (see [tenants](../common/TENANT.md#deletion)) removes their credentials, sessions, grants, and tokens; the audit keeps that the deletion happened. Permit leases id ranges from pond for user ids, so a user's id is unique everywhere and is a natural key in every bucket.
 
 ## Authentication
 
@@ -84,6 +84,27 @@ A route's `permit` field is a requirement over grants, from goober's identity de
 - **A parameter is bound when every clause uses it, or is realm-wide.** Only a bound parameter may choose an object (see barn's iron slots), so a caller can only address objects they hold a grant for.
 - Host roles satisfy only clauses that name host roles.
 
+## Operator roles and agent hierarchy
+
+The people and agents who run a site hold grants too. An operator role is `ops/{role}`, in the tenant's own realm: `ops/content`, `ops/deploy`, `ops/data`, `ops/observe`, `ops/mail`, `ops/identity`, and `ops/admin`, which holds every role. The role tree (which roles exist, what each contains, which may delegate) is configuration in rancher, published on its config log, which permit follows. [Porch](../porch/IDEA.md) uses these grants to decide which tools an agent sees at `/mcp/{role}`.
+
+- **Only the identity role gives operator roles.** `ops/` grants come from `permit.control.grant` (an owner or `ops/identity` member acting through rancher's tools) or from consent and delegation below. A route's `gives` can never name an `ops/` role, so no box can make someone an operator.
+- **Host operators map in.** `host:admin` holds every role on every `ops.` domain, audited per tenant entered, as before; it still satisfies no tenant clause.
+- **The tree only implies within `ops/`.** `ops/admin` holding `ops/content` is the role tree's rule, applied by `porch_roles`; product grants (`editor/project_42`) never imply each other, and `permit_require` stays exact.
+
+**Agents delegate to agents.** A lead agent can hand a narrower job to another agent without a person in the loop, and without that agent ever holding more than the job:
+
+| rule | |
+| --- | --- |
+| Who may delegate | A token holding a role the tree marks `delegates` (`admin` and `deploy` to start). |
+| What a child holds | A subset of its parent's grants, after the tree's containment (a parent with `ops/admin` may give `ops/content`). Never `host:` roles, never product grants the parent lacks. |
+| How long | No longer than its parent's session; one hour by default, 24 hours at most. |
+| How deep | Three levels: a person's agent, its child, and one grandchild. |
+| Revocation | Revoking a session revokes every session below it. A child's token carries its lineage, so barn refuses it the moment any ancestor is revoked, without permit publishing every descendant. |
+| Audit | Every mint records parent, child, grants, purpose, and lifetime; every tool call's log line carries the lineage. |
+
+A child is minted by an OAuth 2.0 token exchange (RFC 8693) at `/_permit/oauth/token`: the parent presents its own token and asks for a scope, and gets a new `agent` token with its own session. The consent was the person's, given once to the lead agent; delegation is bounded by it.
+
 ## Granting from a route
 
 Products grant and revoke their own roles through routes, so a product's security model uses permit instead of inventing one:
@@ -107,7 +128,9 @@ A box on that route may ask barn to grant or revoke the listed roles, with the r
 - **A user's id is a pond id.** Unique everywhere, and a key in every bucket.
 - **Grants are strings, scoped by `/`.** `:` is for host roles and `_` for system roles; neither can be substituted in.
 - **Every token is signed, expiring or revocable, and audited.** Barn can verify it without permit.
-- **An agent never holds more than its subject.**
+- **An agent never holds more than its subject, or its parent.** Sub-agents are subsets, shorter-lived, at most three deep, and revoked with any ancestor.
+- **Operator roles are `ops/{role}` grants, and no route can give one.**
+- **Private keys live in cellar,** loaded only to sign.
 - **Only bound parameters choose objects.** A caller addresses only what a grant names.
 - **Grants from a route ride pond's outbox.** A grant exists if and only if its write landed.
 - **Grant lists are short.** At most 250 per subject.

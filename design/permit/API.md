@@ -11,7 +11,7 @@ Permit is off the request path, so its API is shaped to keep it there. Barn neve
 So permit has four surfaces:
 
 1. **The feed** barn follows: keys, revocations, and grant changes.
-2. **The pages** barn proxies: sign-in, consent, and OAuth, under `/_permit/`.
+2. **The pages** barn proxies: sign-in, consent, OAuth, and agent delegation, under `/_permit/`.
 3. **The effects** permit drains from pond's outbox: grants, revocations, and tokens a route gave.
 4. **The control API** rancher drives: realms, users, operators, audit, and key rotation.
 
@@ -31,6 +31,7 @@ Plus the **contracts** of the two libraries, which are as much permit's API as a
 | `permit.control.audit.read` | call | rancher | no (the read is itself audited) | Audit entries, newest first, paged |
 | `permit.control.keys.rotate` | call | rancher | yes | The new key id and when the old one retires |
 | `permit.control.status` | call | rancher | no | Per realm: users, sessions, grants, tokens, feed seq |
+| `permit.control.agents.list`, `.revoke` | call | rancher | list no, revoke yes | A subject's agent sessions as a tree, with grants, purpose, and expiry; revoking one revokes its descendants |
 
 Permit also calls out:
 
@@ -40,6 +41,7 @@ Permit also calls out:
 | `pond.outbox.lease`, `pond.outbox.ack` | pond | Grant, revoke, and token effects addressed `to: "permit"` (Q12.1) |
 | `pond.deletions.subscribe` | pond | User and tenant deletions (Q12.2) |
 | `barker.send` | barker | Sign-in codes and grant notices, category `auth` |
+| `rancher.config.subscribe` (kind `role.put`) | rancher | The operator role tree, for consent and delegation |
 | `rancher.problems.report` | rancher | Problems |
 | `ranger.ingest` | ranger | The `identity` and `audit` streams |
 
@@ -63,6 +65,7 @@ v1.<key id>.<base64url claims>.<base64url signature>
 	"sub": "4294967100",
 	"session": "4294967555",
 	"grants": ["editor/project_42"],
+	"lineage": [],
 	"iat": 1762870400,
 	"exp": 1762874000
 }
@@ -77,13 +80,14 @@ v1.<key id>.<base64url claims>.<base64url signature>
 | sub | The subject. Absent for `capability` and `invite`. |
 | session | The session it was refreshed from, for `user` and `agent`. Revoking a session revokes its tokens. |
 | grants | For `agent`, `capability`, and `invite`: the grants it carries. For `user`, absent: grants are live. For `operator`, `host:` roles only. |
+| lineage | For `agent` tokens minted by delegation: the ancestor sessions, root first, at most three. `verify` refuses the token if any is revoked. Empty for a token from consent. |
 | iat, exp | Issued and expiry, in seconds. Access tokens live 15 minutes; capabilities and invites as long as they were minted for. |
 
 ```cpp
 namespace homestead::permit::token {
 enum class Kind { user, agent, capability, invite, operator_ };
 struct Claims { Id id; std::string realm; Kind kind; std::optional<Id> sub, session;
-                std::vector<std::string> grants; int64_t iat, exp; };
+                std::vector<std::string> grants; std::vector<Id> lineage; int64_t iat, exp; };
 struct KeySet;   // public keys by id, with their retire times
 enum class Refusal { malformed, unknown_version, unknown_key, bad_signature, expired, wrong_realm, revoked };
 std::variant<Claims, Refusal> verify(std::string_view token, const KeySet&, const Revocations&,
@@ -92,7 +96,7 @@ std::string sign(const Claims&, const PrivateKey&);   // permit only; barn never
 }
 ```
 
-`verify` is pure: barn passes the key set and revocations it holds from the feed, the realm it resolved, and the request's time.
+`verify` is pure: barn passes the key set and revocations it holds from the feed, the realm it resolved, and the request's time. A token whose `session` or any `lineage` entry is revoked is `revoked`. Adding `lineage` is an additive claim within `v1`: a token without it has an empty lineage.
 
 ## Requirements: the `permit_require` contract
 
@@ -178,11 +182,41 @@ Barn proxies every request under `/_permit/` on a tenant's domain as an `HttpReq
 | `POST /_permit/refresh` | A fresh access token from a session cookie or refresh token. |
 | `POST /_permit/sign-out` | Ends the session; revokes its tokens. |
 | `GET /_permit/oauth/authorize` | OAuth 2.1 authorization code with PKCE; shows the consent screen naming the domain and the grants asked for. |
-| `POST /_permit/oauth/token` | Code and refresh grants. Answers an `agent` token. |
+| `POST /_permit/oauth/token` | Code and refresh grants, and token exchange for delegation (below). Answers an `agent` token. |
 | `POST /_permit/oauth/register` | Dynamic client registration for MCP clients. |
 | `POST /_permit/oauth/revoke` | Token revocation. |
 | `GET /.well-known/oauth-authorization-server` | Metadata, proxied from the domain's root by barn. |
 | `GET /_permit/invite/{token}` | Redeem an invite after sign-in. |
+
+### Delegation: token exchange
+
+A lead agent mints a sub-agent by RFC 8693 token exchange, on the `ops.` domain whose realm it acts in:
+
+```
+POST /_permit/oauth/token
+grant_type=urn:ietf:params:oauth:grant-type:token-exchange
+&subject_token=v1.k7.eyJ2IjoxLCJpZCI6...           (the parent's agent token)
+&subject_token_type=urn:ietf:params:oauth:token-type:access_token
+&scope=ops/content
+&requested_lifetime=3600
+&purpose=Rewrite the services pages
+```
+
+```json
+{ "access_token": "v1.k7.eyJ2IjoxLCJpZCI6...", "token_type": "Bearer", "expires_in": 900,
+  "refresh_token": "...", "scope": "ops/content", "session": "4294967890",
+  "lineage": ["4294967555"], "session_expires_at": 1762874000 }
+```
+
+| check | refusal |
+| --- | --- |
+| The parent token verifies, is an `agent` or `user` token, and its realm is this domain's | `invalid_grant` |
+| The parent holds a role the tree marks `delegates` | `access_denied` |
+| Every requested scope is held by the parent, after the tree's containment | `invalid_scope`, naming the scope |
+| The lineage would be at most three deep | `access_denied` |
+| The lifetime is at most the parent session's remaining life and 24 hours | Shortened, never refused |
+
+The child gets its own session, whose refresh token rotates like any session and can't outlive `session_expires_at`. The `purpose` is stored in the audit and shown wherever the person sees agent sessions. Consent isn't asked again: the person consented to the lead agent's grants, and a child is bounded by them.
 
 - **Cookies** are set for the exact domain, `Secure`, `HttpOnly`, `SameSite=Lax`, named `__Host-session`.
 - **Every state-changing POST** checks `Origin` against the request's domain.
@@ -203,6 +237,7 @@ Under the lean of [Q12.1](../OPEN.md#q121-who-drains-the-outbox), permit drains 
 | --- | --- |
 | `grant` | Adds the grant to the subject, unless it already holds it. |
 | `revoke` | Removes it, and for `agent` tokens derived from the subject, revokes any that carried it. |
+| (any) | An effect naming an `ops/` role is refused, as for `host:` and `_` roles: operator roles come only from the control API, consent, and delegation. |
 | `mint` | Mints a `capability` or `invite` token for the given grants and expiry, stores it by id, and records it. The token's text is never in pond: the box gets the token id, and the holder fetches the text once from `/_permit/` (Q-permit.1). |
 
 - **Deduplicated by key.** The element's key (tenant, seq, position) is remembered for 30 days; a redelivery answers the first outcome.
@@ -235,7 +270,8 @@ Only rancher calls `permit.control.*`. Every changing call takes an idempotency 
 | `operator.put`, `operator.drop` | Operator accounts and their `host:` roles. Dropping one revokes every token it holds. |
 | `grant`, `revoke` | An operator acting in a tenant. Recorded as the operator, never as a tenant member. |
 | `audit.read` | By realm, subject, kind, and time, paged by cursor. |
-| `keys.rotate` | Publishes a new key, signs with it after one feed round, and retires the old one after the longest access token lifetime. |
+| `keys.rotate` | Generates a new key in [cellar](../cellar/IDEA.md), publishes its public half, signs with it after one feed round, and retires the old one after the longest access token lifetime. |
+| `agents.list`, `agents.revoke` | The agent sessions of a subject as a tree; revoking a node revokes its subtree and publishes one `revoke { session }` for it. |
 | `status` | Counts only. |
 
 ## Problems
@@ -247,6 +283,7 @@ Only rancher calls `permit.control.*`. Every changing call takes an idempotency 
 | `permit.sign_in_hammered` | Too many sign-in attempts for one address hash or peer. |
 | `permit.requirement_unsatisfiable` | Reported by rancher's route check through `permit_require`: no grant anyone can hold satisfies it. |
 | `permit.effect_dead` | An outbox element permit could not apply before its deadline. |
+| `permit.delegation_refused` | A token exchange asked for more than its parent holds, or deeper than three. Counted per parent session, since an agent doing it repeatedly is confused or probing. |
 
 ## The schema, in part
 
@@ -267,7 +304,8 @@ table GrantsAnswer { seq: uint64; grants: [string]; }
 ## The invariants
 
 - **Barn verifies without calling.** Tokens and requirements are checked by libraries barn links; permit is called only when identity changes.
-- **Only permit holds a private key.** The feed carries public keys and ids, never secrets or grant lists.
+- **Only permit holds a private key, and only through cellar.** The feed carries public keys and ids, never secrets or grant lists.
+- **A sub-agent holds a subset of its parent, for no longer than its parent,** and is refused the moment any ancestor is revoked.
 - **A key is published before it signs.** A token is never signed by a key a barn hasn't been offered.
 - **A grant from a route arrives through pond's outbox,** deduplicated by its key, in commit order per subject.
 - **Only rancher calls the control API.** Operators act as operators, never as tenant members.

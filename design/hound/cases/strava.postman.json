@@ -1,0 +1,190 @@
+{
+	"info": {
+		"name": "Strava through hound",
+		"description": "Validates hound against Strava's API v3 with a per-user OAuth token (oauth2-user). The auth folder refreshes the token directly at Strava's token endpoint, the way hound_auth does on expiry; the read folder runs through the `strava` binding as a box would. Field names are from Strava's API reference as best understood; verify against https://developers.strava.com/docs/reference/ before relying on them.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"auth": {
+		"type": "bearer",
+		"bearer": [{ "key": "token", "value": "{{strava_access_token}}", "type": "string" }]
+	},
+	"variable": [
+		{ "key": "base", "value": "https://www.strava.com/api/v3" },
+		{ "key": "token_url", "value": "https://www.strava.com/oauth/token" }
+	],
+	"hound": {
+		"egress": {
+			"strava": {
+				"origin": "https://www.strava.com",
+				"prefixes": ["/api/v3/"],
+				"methods": ["GET"],
+				"credential": { "kind": "oauth2-user", "secret": "tenant/strava_app" },
+				"rate": "100/15m"
+			}
+		}
+	},
+	"item": [
+		{
+			"name": "auth",
+			"item": [
+				{
+					"name": "refresh the access token",
+					"request": {
+						"auth": { "type": "noauth" },
+						"method": "POST",
+						"header": [{ "key": "Content-Type", "value": "application/x-www-form-urlencoded" }],
+						"url": "{{token_url}}",
+						"body": {
+							"mode": "urlencoded",
+							"urlencoded": [
+								{ "key": "client_id", "value": "{{strava_app.client_id}}" },
+								{ "key": "client_secret", "value": "{{strava_app.client_secret}}" },
+								{ "key": "grant_type", "value": "refresh_token" },
+								{ "key": "refresh_token", "value": "{{strava_refresh_token}}" }
+							]
+						}
+					},
+					"hound": {
+						"writes": false,
+						"expect": {
+							"status": 200,
+							"json": [
+								{ "path": "$.token_type", "op": "eq", "value": "Bearer" },
+								{ "path": "$.access_token", "op": "exists" },
+								{ "path": "$.refresh_token", "op": "exists" },
+								{ "path": "$.expires_at", "op": "type", "value": "integer" }
+							]
+						},
+						"capture": {
+							"strava_access_token": { "var": "$.access_token", "secret": true },
+							"strava_refresh_token": { "var": "$.refresh_token", "secret": true },
+							"strava_expires_at": "$.expires_at"
+						}
+					}
+				}
+			]
+		},
+		{
+			"name": "read",
+			"item": [
+				{
+					"name": "who am I",
+					"request": { "method": "GET", "url": "{{base}}/athlete" },
+					"hound": {
+						"binding": "strava",
+						"expect": {
+							"status": 200,
+							"headers": { "x-ratelimit-usage": { "op": "matches", "value": "^[0-9]+,[0-9]+$" } },
+							"json": [
+								{ "path": "$.id", "op": "type", "value": "integer" },
+								{ "path": "$.firstname", "op": "type", "value": "string" }
+							]
+						},
+						"capture": { "athlete_id": "$.id" }
+					}
+				},
+				{
+					"name": "recent activities",
+					"request": { "method": "GET", "url": "{{base}}/athlete/activities?per_page=5" },
+					"hound": {
+						"binding": "strava",
+						"expect": {
+							"status": 200,
+							"json": [
+								{ "path": "$", "op": "type", "value": "array" },
+								{ "path": "$[0].id", "op": "exists" },
+								{ "path": "$[0].sport_type", "op": "type", "value": "string" },
+								{ "path": "$[0].start_date", "op": "matches", "value": "^\\d{4}-\\d{2}-\\d{2}T" }
+							]
+						},
+						"capture": { "activity_id": "$[0].id" }
+					}
+				},
+				{
+					"name": "one activity",
+					"request": { "method": "GET", "url": "{{base}}/activities/{{activity_id}}" },
+					"hound": {
+						"binding": "strava",
+						"expect": {
+							"status": 200,
+							"json": [
+								{ "path": "$.id", "op": "eq", "value": "{{activity_id}}" },
+								{ "path": "$.distance", "op": "type", "value": "number" },
+								{ "path": "$.moving_time", "op": "type", "value": "integer" }
+							]
+						}
+					}
+				},
+				{
+					"name": "athlete stats",
+					"request": { "method": "GET", "url": "{{base}}/athletes/{{athlete_id}}/stats" },
+					"hound": {
+						"binding": "strava",
+						"expect": {
+							"status": 200,
+							"json": [
+								{ "path": "$.all_run_totals.count", "op": "type", "value": "integer" },
+								{ "path": "$.recent_ride_totals", "op": "exists" }
+							]
+						}
+					}
+				},
+				{
+					"name": "heart rate and power zones",
+					"description": "Needs the profile:read_all scope; a token without it answers 401, which is an expected failure, not a hound bug.",
+					"request": { "method": "GET", "url": "{{base}}/athlete/zones" },
+					"hound": {
+						"binding": "strava",
+						"expect": { "status": 200, "json": [{ "path": "$.heart_rate", "op": "exists" }] }
+					}
+				}
+			]
+		},
+		{
+			"name": "policy",
+			"description": "Each item must be refused by hound_policy with the named code, and nothing may be sent.",
+			"item": [
+				{
+					"name": "the deauthorize endpoint is outside the prefix",
+					"request": { "method": "POST", "url": "https://www.strava.com/oauth/deauthorize" },
+					"hound": { "binding": "strava", "expect": { "refused": "policy.path_outside_prefix" } }
+				},
+				{
+					"name": "prefix boundary",
+					"request": { "method": "GET", "url": "{{base}}x/athlete" },
+					"hound": { "binding": "strava", "expect": { "refused": "policy.path_outside_prefix" } }
+				},
+				{
+					"name": "traversal out of the prefix",
+					"request": { "method": "GET", "url": "{{base}}/../../oauth/token" },
+					"hound": { "binding": "strava", "expect": { "refused": "policy.path_ambiguous" } }
+				},
+				{
+					"name": "double-encoded traversal",
+					"request": { "method": "GET", "url": "{{base}}/%252e%252e/oauth/token" },
+					"hound": { "binding": "strava", "expect": { "refused": "policy.path_ambiguous" } }
+				},
+				{
+					"name": "the box sets Authorization",
+					"request": {
+						"auth": { "type": "noauth" },
+						"method": "GET",
+						"header": [{ "key": "Authorization", "value": "Bearer someone-elses-token" }],
+						"url": "{{base}}/athlete"
+					},
+					"hound": { "binding": "strava", "expect": { "refused": "policy.header_reserved" } }
+				},
+				{
+					"name": "a write on a read-only binding",
+					"request": { "method": "POST", "url": "{{base}}/activities" },
+					"hound": { "binding": "strava", "expect": { "refused": "policy.method_not_allowed" } }
+				},
+				{
+					"name": "origin swap by absolute URL",
+					"request": { "method": "GET", "url": "https://strava.example.net/api/v3/athlete" },
+					"hound": { "binding": "strava", "expect": { "refused": "policy.absolute_url" } }
+				}
+			]
+		}
+	]
+}

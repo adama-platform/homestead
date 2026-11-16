@@ -102,7 +102,7 @@ Ranger keeps each stream in hourly segments, compressed once closed, with a smal
 | where | how long | what |
 | --- | --- | --- |
 | On ranger's disk | 7 days | Every segment, searchable. |
-| Object storage | 400 days | Each closed day, sealed with the backup key, with a manifest of its first and last seq, its chains, its line count, and its hash. Restorable for search, not searched in place. |
+| Object storage | 400 days | Each closed day, sealed with the backup key (a secret opened with [cellar](../cellar/IDEA.md)), with a manifest of its first and last seq, its chains, its line count, and its hash. Restorable for search, not searched in place. |
 
 A day's archive and its manifest let anyone check that no segment is missing and no line was changed. `log_verify` walks the chains and answers the first break.
 

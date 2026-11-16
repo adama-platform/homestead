@@ -27,13 +27,14 @@ A person reads six packages line by line: `pond_wal`, `pond_write`, `pond_apply`
 | `pond_query` | `homestead::pond::query` | The gate: fork's check, the read-only connection, authorizer, `stmt_readonly`, progress handler, row cap; named query preparation | `fork_api`, `pond_tenantdb` | R0 |
 | `pond_wait` | `homestead::pond::wait` | Bounded waits on tenant seq and table cursors, for holds, `min_seq`, and `pond.wait` | `pond_model`, `common_core` | R1 |
 | `pond_feed` | `homestead::pond::feed` | Subscriptions over `_changes`: filters by bucket and id, table progress, resets | `pond_tenantdb`, `pond_wait` | R1 |
+| `pond_events` | `homestead::pond::events` | Event tailers: a cursor per tenant per event route, leases to barns by credit, order per (route, id), retries, dead events | `pond_tenantdb`, `pond_wait`, `common_core` | R1 |
 | `pond_outbox` | `homestead::pond::outbox` | Leases over `_outbox` per consumer, order per scope, acks, dead elements | `pond_tenantdb`, `common_core` | R1 |
 | `pond_deletions` | `homestead::pond::deletions` | User delete as one write; the cross-tenant deletions log and its subscription | `pond_write`, `pond_catalog` | R1 |
 | `pond_replica` | `homestead::pond::replica` | Chain replication of WAL records: head, middle, tail; epochs; durable positions | `pond_wal`, `common_wire` | R0 |
 | `pond_ship` | `homestead::pond::ship` | Nightly snapshots and continuous WAL shipping to object storage; restore | `pond_wal`, `pond_tenantdb`, `common_blob` | R1 |
 | `pond_control` | `homestead::pond::control` | The control API's logic: tenants, buckets, tables, named queries, status; idempotent by content | `pond_catalog`, `pond_tailer`, `pond_query`, `pond_deletions` | R1 |
 | `pond_engine` | `homestead::pond::engine` | The per-tenant pipeline: write queue, applier thread, tailer scheduling; what `pond_server` calls | `pond_write`, `pond_wal`, `pond_apply`, `pond_tailer`, `pond_feed`, `pond_wait` | R1 |
-| `pond_server` | `homestead::pond::server` | Binds `pond.*` methods to the engine and control, checks caller services | `pond_proto`, `pond_engine`, `pond_control`, `pond_outbox`, `pond_replica` | R2 |
+| `pond_server` | `homestead::pond::server` | Binds `pond.*` methods to the engine and control, checks caller services | `pond_proto`, `pond_engine`, `pond_control`, `pond_outbox`, `pond_events`, `pond_replica` | R2 |
 | `pond_client` | `homestead::pond::client` | The `Pond` interface, its wire implementation, and the contract test suite | `pond_proto`, `common_wire` | R2 |
 | `pond_fake` | `homestead::pond::fake` | An in-memory `Pond`: seqs, `if-seq`, idempotency, names, feeds, outbox; passes the contract tests | `pond_client`, `common_merge` | R2 |
 | `pond_system` | `homestead::pond::system` | The composition root | everything above | R2 |
@@ -112,6 +113,7 @@ pond_client --- pond_proto --- common_wire          pond_fake --- pond_client
 | `pond_tailer` | A table equals a rebuild from documents at the same cursor | Incremental vs full rebuild equality, joins over three buckets, type mismatches become problems | Stop on a bad document |
 | `pond_wait` | Every wait ends by its bound and says how far each table got | Manual clock; wakeups on progress | Spin |
 | `pond_feed` | Every change once, in seq order, filtered, or a `reset` | Slow subscribers, resubscribe from every seq | Send contents |
+| `pond_events` | Every matching change reaches its route at least once, in seq order per id, or ends dead; a cursor never passes an unacknowledged event | Lease expiry, competing barns, a hot id beside many cold ones, redrive, restart mid-lease, `start: beginning` | Run boxes or read documents |
 | `pond_outbox` | Each element is leased to one consumer at a time, in order per scope, until acked or dead | Lease expiry, competing consumers, out-of-order acks | Interpret bodies |
 | `pond_deletions` | Deleting a user removes their documents and names in one write and publishes one event | Cross-check against the WAL's user annotations | Delete other services' copies |
 | `pond_ship` | Restore = snapshot + shipped WAL equals the live tenant at that seq | Restore round trip in `common_blob`'s local implementation | Ship unfinished segments |
@@ -126,7 +128,7 @@ pond_client --- pond_proto --- common_wire          pond_fake --- pond_client
 | --- | --- |
 | 1 network `io_context`, N threads | `common_wire`, `pond_server` decoding, feed fan-out |
 | 1 WAL thread | Group commit and fsync |
-| 1 applier per active tenant, from a pool | `pond_apply`, then `pond_tailer` and feed publish for that tenant |
+| 1 applier per active tenant, from a pool | `pond_apply`, then `pond_tailer`, feed publish, and event cursor wakeups for that tenant |
 | A read pool | `pond_query` runs, so a slow query never blocks a write |
 | 1 shipper | Snapshots and WAL shipping |
 
@@ -136,7 +138,7 @@ pond_client --- pond_proto --- common_wire          pond_fake --- pond_client
 ## Review queue
 
 1. **R0**, read line by line: `pond_wal`, `pond_record`, `pond_ids`, `pond_write`, `pond_apply`, `pond_query`, `pond_replica`.
-2. **R1**, read contract, QUALITY.md, and tests: `pond_model`, `pond_engine`, `pond_tenantdb`, `pond_tailer`, `pond_wait`, `pond_feed`, `pond_outbox`, `pond_deletions`, `pond_catalog`, `pond_ship`, `pond_control`.
+2. **R1**, read contract, QUALITY.md, and tests: `pond_model`, `pond_engine`, `pond_tenantdb`, `pond_tailer`, `pond_wait`, `pond_feed`, `pond_events`, `pond_outbox`, `pond_deletions`, `pond_catalog`, `pond_ship`, `pond_control`.
 3. **R2/R3**: `pond_server`, `pond_client`, `pond_fake`, `pond_system`, `pond_proto`, `pond_main`.
 
 Build order, with what can go in parallel on each line:
@@ -144,7 +146,7 @@ Build order, with what can go in parallel on each line:
 1. `pond_model`, `pond_wal`, `pond_proto` (and fork, independently)
 2. `pond_record`, `pond_ids`, `pond_tenantdb`, `pond_catalog`, `pond_client` + `pond_fake` (unblocks barn)
 3. `pond_write`, `pond_apply`, `pond_wait`, `pond_query`
-4. `pond_tailer`, `pond_feed`, `pond_outbox`, `pond_deletions`, `pond_replica`, `pond_ship`
+4. `pond_tailer`, `pond_feed`, `pond_events`, `pond_outbox`, `pond_deletions`, `pond_replica`, `pond_ship`
 5. `pond_engine`, `pond_control`
 6. `pond_server`, `pond_system`, `pond_main`
 
@@ -155,5 +157,6 @@ Build order, with what can go in parallel on each line:
 - **No R0 package owns a thread or knows the wire.** Threads live in `pond_engine` and the system; the wire in `pond_server` and `pond_replica`'s transport.
 - **The WAL knows bytes; the record knows writes; the validator knows rules; the applier knows the file.** Each in its own package.
 - **SQLite prepares only fork's output, and only `pond_query` prepares reads.**
-- **Tables, feeds, and the outbox are R1** because a rebuild or a redelivery repairs them.
+- **Tables, feeds, event tailers, and the outbox are R1** because a rebuild or a redelivery repairs them. Event tailers share the tailers' cursor machinery; there is no separate bus.
+- **`pond_write` refuses `_` buckets** from anything but barn's system path; that check is R0.
 - **`pond_fake` passes the same contract tests as pond.**

@@ -19,7 +19,10 @@ Rancher is one machine. It holds configuration, drives pond's and permit's contr
 | Tenant | bobs_plumbing | That a tenant exists, its state, and its quotas. Rancher creates it in pond and permit. |
 | Domain | bobsplumbing.com -> bobs_plumbing | The domain registry: which tenant a domain provides, as primary, redirect, beta, or ops, and its verification. |
 | Table | jobs@2, from bucket jobs | A versioned tailer definition, applied to pond in the tenants that use it. |
-| Box | accounts@sha256:9f3c... | A module, its exports, and its write ruleset. Immutable once uploaded. |
+| Box | accounts@sha256:9f3c... | A module, its exports, and its rulesets: the buckets it may write, the asset names and egress names it may use. Immutable once uploaded. |
+| Spec | strava@sha256:41d0... | An OpenAPI document an egress binding names, stored by hash like a module and fetched by barns. |
+| Secret | tenant/bobs_plumbing/hevy_api_key | A sealed secret, which rancher stores and publishes but can never open (see [Secrets](#secrets)). |
+| Role | content, data, deploy, ... | The operator role tree, which decides what each `/mcp/{role}` endpoint offers. |
 | Service | accounts | A logical endpoint with a traffic policy over box versions. |
 | Route | PUT bobsplumbing.com/me/address -> accounts.put_address | Permit requirement, objects, grant, hold, and the service and export that answer. |
 | Barn | barn-7 | A registered barn: its address, its config seq, its health, and its failure counts per route. |
@@ -54,13 +57,16 @@ Agents work in beta. The person owns production.
 	"exports": ["put_address", "get_me", "render_me"],
 	"topology": "request-response",
 	"writes": ["addresses", "profiles", "settings"],
-	"fetch": { "geocoder": { "url": "https://geo.example", "effect": "none" } },
+	"assets": ["photos"],
+	"egress": ["geocoder"],
 	"isolation": "reset",
 	"limits": { "fuel": 100000000, "memory-max-bytes": 67108864, "timeout-ms": 1000 }
 }
 ```
 
-That is all a box declares. `topology` is request-response or streaming (see [barn](../barn/IDEA.md#the-box-contract)). `writes` is its write ruleset: the buckets it may ever merge into or delete from, in any tenant. It doesn't name a tenant, a domain, a URL, a table, or a role. A box can be uploaded, checked, and sit unused forever.
+That is all a box declares. `topology` is request-response or streaming (see [barn](../barn/IDEA.md#the-box-contract)). `writes` is its write ruleset: the buckets it may ever merge into or delete from, in any tenant. `assets` names the S3 asset areas it may ever touch, and `egress` names the third-party services it may ever call; neither says where they are. It doesn't name a tenant, a domain, a URL, a prefix, a table, or a role. A box can be uploaded, checked, and sit unused forever.
+
+The three rulesets work the same way: **names at deploy, places at runtime.** The box says "photos" and "geocoder"; each route says which S3 prefix "photos" is for this request, and which origin, URI prefixes, and credential "geocoder" is. A box can't reach an asset area or a service it didn't declare, and a route can't hand it one.
 
 Uploading a box checks that the module imports only the ABIs it lists and exports what it says. A box version never changes; a new module is a new version, and a new version that widens `writes` says so, so a person approving it sees the widening.
 
@@ -83,6 +89,15 @@ Uploading a box checks that the module imports only the ABIs it lists and export
 	},
 	"queries": { "me": "SELECT id, name, city FROM users WHERE id = :!user_id" },
 	"hold": { "tables": ["users@1"], "timeout-ms": 500 },
+	"assets": {
+		"photos": { "prefix": "photos/{!user_id}/", "access": ["read", "write", "list", "delete"],
+		            "max-bytes": 10485760, "types": ["image/*"] }
+	},
+	"egress": {
+		"geocoder": { "origin": "https://geo.example", "prefixes": ["/v1/geocode"], "methods": ["GET"],
+		              "credential": { "kind": "api-key", "header": "x-api-key", "secret": "tenant/bobs_plumbing/geocoder" },
+		              "spec": "sha256:41d0...", "rate": "10/s" }
+	},
 	"limits": { "rate": "10/s", "body-max-bytes": 4096 }
 }
 ```
@@ -94,6 +109,8 @@ Uploading a box checks that the module imports only the ABIs it lists and export
 | grant | Which tables, versions, and columns the box's SQL may read, and which rows | Fork, against the table versions' columns. |
 | queries | Named queries the box runs by name, checked once at deploy and prepared once by pond | Fork, against the grant and the table versions' columns. |
 | hold, then | Whether the answer waits for tables to catch up, and what renders it | The held tables exist; `then` is an export. |
+| assets | Which S3 prefix each asset name means for this request, and what the box may do there (read, write, list, delete), with size and type caps | Every name is in the `assets` of every box version the service may run; every `{param}` in a prefix is bound by the permit requirement, as for objects; barn always adds the tenant's own prefix in front. |
+| egress | Which origin, URI prefixes, and methods each egress name may reach, which credential barn attaches, which OpenAPI spec describes it, and its rate | Every name is in the `egress` of every box version; the origin is https; prefixes are normalized and non-empty; the secret exists and is sealed for barn; the spec hash was uploaded. |
 
 Routing is where security lives. Rancher checks a route when it is created, and again when a service's policy adds a box version, so a route can never give a box a write its ruleset doesn't allow, and a ramp can never send traffic to a version that would violate a route.
 
@@ -106,8 +123,42 @@ Routes cover every protocol barn speaks:
 | MCP | `mcp`, domain, tool name |
 | Email | `mail`, local part, domain (or every mail-enabled domain) |
 | Timer | `timer`, name; fired by sun, with objects that may bind payload fields |
+| Event | `event`, name; fired by pond's event tailer on a bucket's changes, with objects that may bind `{event.id}` and `{event.user}` |
+
+A route can also answer without a box, for bytes in S3 (silo, inside barn):
+
+| form | on | does |
+| --- | --- | --- |
+| `"serve": { "asset": "media", "key": "{*path}" }` | GET | Streams the object under the asset's prefix; no box wakes. |
+| `"upload": { "asset": "photos", "key": "{uuid}.{ext}" }` | PUT, POST | Streams the body to S3 under the prefix, with the route's size and type caps; an optional `then` export sees what was stored. |
+| `"attachments": { "asset": "photos", "max-files": 10 }` | a box route | Barn stores each multipart part first, and the box gets their keys, sizes, and types instead of bytes. |
+
+A box with `write` on an asset may also presign an upload for a browser, inside its prefix. Garbage collection is the box's job: a box granted `list` and `delete` sweeps what its own documents no longer name.
 
 The conflict rules come from goober: the domain is the primary key, types count when comparing paths, every request resolves to exactly one route or none, and a route that overlaps an existing one is refused unless it comes with a traffic decision.
+
+## Event routes
+
+Pond is the event bus (see [pond](../pond/IDEA.md#event-routes)): an event route is a tailer over a bucket's changes whose sink is a box. Rancher owns the route like any other, and applies only its `on` to pond with `pond.control.events.put`.
+
+```json
+{
+	"route": "event order_placed",
+	"service": "fulfilment",
+	"export": "on_order",
+	"on": { "bucket": "orders", "ops": ["merge"] },
+	"objects": {
+		"order": { "bucket": "orders", "id": "{event.id}", "access": "read" },
+		"stock": { "bucket": "reservations", "id": "{event.id}", "access": "merge" }
+	}
+}
+```
+
+Rancher checks three more things for an event route:
+
+- **No loops.** If any box version the service may run can write the bucket the route listens to, the route (or the policy that adds that version) is refused with `route.event_loop`. Chains across buckets are allowed, and the promotion diff shows each chain as one widening: "a merge into `orders` runs `on_order`, which merges into `reservations`."
+- **One environment.** Both environments see every write to the tenant's data, so an event route is live in exactly one. A new event route in beta runs as a shadow: barns run it, record its merges, and discard them. Promotion moves it to production, where it takes over the cursor pond already keeps, so nothing is missed or run twice.
+- **Objects bind only the event.** `{event.id}` and `{event.user}` are the only sources besides reserved values and `new`; an event route has no caller and no permit requirement.
 
 ## Services and traffic
 
@@ -174,15 +225,40 @@ rancher -> barn   { "seq": 8815, "kind": "route.put", "route": { ... } }
 
 ## Driving pond, permit, and sun
 
-Rancher is the only caller of pond's, permit's, and sun's control APIs. Creating a tenant creates its pond database and its permit realm; putting a table version applies it to pond; putting a route registers its named queries, checked by fork, with pond; putting a recurring schedule on a timer route applies it to sun. Reading and redriving sun's dead letter box goes through rancher's API too. Every apply is idempotent and retried until it lands, so rancher can always re-apply its view.
+Rancher is the only caller of pond's, permit's, and sun's control APIs. Creating a tenant creates its pond database and its permit realm; putting a table version applies it to pond; putting a route registers its named queries, checked by fork, with pond; putting an event route applies its cursor to pond; putting a recurring schedule on a timer route applies it to sun. Reading and redriving sun's dead letter box goes through rancher's API too. Every apply is idempotent and retried until it lands, so rancher can always re-apply its view.
 
 ## Problems
 
 Rancher keeps the problem log: pond, barn, permit, sun, and rancher's own checks report problems to it, rancher groups them by fingerprint, and operators and agents read them through the API. That is described in [problems](../common/PROBLEMS.md).
 
+## Specs
+
+An egress binding names an OpenAPI document by hash. Rancher stores specs like modules: uploaded once, immutable, content-addressed, published to barns in the config log, and fetched by barns with `rancher.spec.fetch`. Barn's [hound](../hound/IDEA.md) uses a spec to validate a box's request against the operation it matches, and to explain a refusal by operation id. A spec never widens anything: the origin, prefixes, and methods on the route are the permission.
+
+## Secrets
+
+Rancher keeps every secret a service or route needs (a tenant's Hevy API key, Strava's OAuth app, the platform's SES credentials), and it can't read any of them. Secrets follow goober's vault design, carried in the [cellar](../cellar/IDEA.md) library:
+
+- **Write-only.** `secret_put` seals the value to the deployment's public wrap key, with cellar's seal function, the moment it arrives. Rancher stores the ciphertext and a fingerprint, never the value, and no tool answers it back.
+- **Named and scoped.** `system/ses`, `tenant/bobs_plumbing/hevy_api_key`. A secret lists the services that may open it (`for: ["barn"]`), and the config log carries it only to those subscribers.
+- **Opened at use.** Barn, permit, or barker open a secret with the root key cellar holds, in memory, for the call that needs it.
+- **Per user, in pond.** Tokens a person grants (Strava's OAuth refresh token) are sealed the same way, but they change at runtime, so barn keeps them in pond's reserved `_credentials` bucket, not in configuration.
+
+## Roles and the operator tools
+
+Every operator tool belongs to the service that implements it. Rancher's (routes, boxes, promotions, problems, secrets) and store's (pages, components, releases) are listed and called over the wire with `rancher.tools.list`/`rancher.tools.call` and `store.tools.list`/`store.tools.call`. Rancher also proxies sun's, barker's, and ranger's tools through its own, so dead letters and logs keep rancher's audit and scoping. People and agents reach them through [porch](../porch/IDEA.md), a library inside barn that serves them over MCP and HTTP on `ops.` domains. Rancher is never on the internet.
+
+A tool says which roles it serves:
+
+```json
+{ "name": "page_patch", "summary": "Replace exact text in a page", "roles": ["content"], "changes": true, "input": { } }
+```
+
+Rancher holds the role tree for the deployment. It starts as `admin`, which contains `deploy`, `content`, `data`, `observe`, `mail`, and `identity`. A role is held as a grant, `ops/{role}`, so an agent's token carries exactly the roles its parent gave it, and never more than its subject has. `/mcp/content` offers the content tools the caller's grants allow; `/mcp` offers every tool they allow. The path focuses an agent; the grant secures it. Tenant `mcp` routes may carry `"roles": [...]` too, so `/mcp/{role}` filters a product's own tools the same way.
+
 ## The operator API
 
-Rancher's API is how people and agents run the platform: upload a box, put a route, try it, shadow it, ramp it, roll it back, put a table version, add a domain, read problems, and review and promote beta to production. It is offered over the internal protocol, and over HTTP and MCP through barn, with goober's engineering practices: every changing call has a dry run, says what it widens, takes an `if-seq`, and has an undo. Barn is its control plane proxy, so rancher is never on the internet.
+Rancher's tools are how people and agents run the platform: upload a box, put a route, try it, shadow it, ramp it, roll it back, put a table version, add a domain, read problems, set secrets, and review and promote beta to production. They are offered over the internal protocol and reached through porch, with goober's engineering practices: every changing call has a dry run, says what it widens, takes an `if-seq`, and has an undo.
 
 ## What rancher is not
 
@@ -195,6 +271,10 @@ Rancher's API is how people and agents run the platform: upload a box, put a rou
 - **A box just exists.** Immutable, content-addressed, and declaring only its exports and the buckets it may write.
 - **Routing owns security.** Who may call, which objects, which tables: all on the route, all checked when the route or a policy changes.
 - **No route gives a box a write outside its ruleset.** For every version the service may run.
+- **Names at deploy, places at runtime.** A box declares the buckets, asset names, and egress names it may use; a route binds each to keys, an S3 prefix, or an origin and URI prefixes, and every `{param}` is bound by the permit requirement.
+- **An event route can't feed itself,** and runs in exactly one environment; promotion hands it the cursor.
+- **Secrets are write-only.** Rancher seals and stores them, and can never open one.
+- **The path focuses, the grant secures.** `/mcp/{role}` narrows the tools offered; `ops/{role}` grants decide what a caller may call.
 - **Table versions are dropped only when no route reads them.**
 - **Every request resolves to exactly one route, or none.**
 - **A shadow never changes the world.**
@@ -202,4 +282,4 @@ Rancher's API is how people and agents run the platform: upload a box, put a rou
 - **A breached guardrail rolls back automatically.**
 - **A route belongs to one tenant.** No route spans tenants.
 - **Barns learn everything from the config log, in order.** A pull always comes before the traffic that needs it.
-- **Rancher is the only caller of pond's, permit's, and sun's control APIs, and is off the request path.**
+- **Rancher is the only caller of pond's, permit's, and sun's control APIs, and is off the request path.** Its tools reach people and agents only through porch, inside barn.
