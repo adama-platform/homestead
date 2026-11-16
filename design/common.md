@@ -22,7 +22,7 @@ Goober's engineering practice held up better than its product design. C++ with a
 
 ## Packages
 
-Every package is one directory under `src/`. The underscore in a package name is a namespace under `homestead::`, so `pond_wal` is `homestead::pond::wal` and builds the static library `homestead_pond_wal`. The long namespace can't collide with anything, and code inside a package rarely spells it out. Names are lean.
+Every package is one directory under `src/`. The full rules (package anatomy, review tiers, kinds of package, the common packages, and how services are wired together) are in [packages](common/PACKAGES.md), and each service lists its own in `design/$service/PACKAGES.md`. The underscore in a package name is a namespace under `homestead::`, so `pond_wal` is `homestead::pond::wal` and builds the static library `homestead_pond_wal`. The long namespace can't collide with anything, and code inside a package rarely spells it out. Names are lean.
 
 ```
 src/
@@ -32,10 +32,10 @@ src/
   common_wire/        homestead::common::wire      the internal protocol: frames, streams, flow control
   common_tls/         homestead::common::tls       optional mutual TLS for the wire, host certificates
   common_sqlite/      homestead::common::sqlite    RAII over sqlite3, statements, pragmas
-  fork_ast/           homestead::fork::ast         the SQL tree
-  fork_parse/         homestead::fork::parse       text -> tree
-  fork_check/         homestead::fork::check       tree x permission set -> verdict
-  fork_print/         homestead::fork::print       tree -> canonical SQL
+  fork_ast/           fork::ast                    the SQL tree (fork is a standalone library, see fork/PACKAGES.md)
+  fork_parse/         fork::parse                  text -> tree
+  fork_check/         fork::check_                 tree x permission set -> verdict
+  fork_print/         fork::print                  tree -> canonical SQL
   pond_wal/           homestead::pond::wal
   pond_bucket/        homestead::pond::bucket
   pond_tailer/        homestead::pond::tailer
@@ -68,7 +68,7 @@ Dependencies flow one way: `common_*` -> library packages -> service packages ->
 | rule | why |
 | --- | --- |
 | `common_*` depends only on third-party code. | Leaves stay reusable and testable alone. |
-| `fork_*` depends only on `common_*`. | The SQL checker is a pure function and must stay one. |
+| `fork_*` depends on nothing but the standard library (Q12.5's lean). | The SQL checker is a pure function and must stay one, and it ships as a library outside homestead. |
 | A service reaches another service only through its `_client` package. | barn includes `pond_client`, never `pond_bucket`. The wire protocol is the boundary, so a service can be rewritten, split, or clustered without its callers noticing. |
 | Only `$service_system` wires packages together. | One composition root per binary, reachable from exactly one object. |
 
@@ -135,7 +135,7 @@ Services talk to each other constantly: every request is a permit check, an obje
 | Calls | Every call has a deadline, carried with it, and an idempotency key where it changes state. |
 | Pipelining | Writes are batched per connection, and pond can group commit them; a barn sends many tenants' writes on one connection. |
 
-Each service publishes its calls through its `_client` package, which is the only code that knows the encoding. A service's API is the schema plus the client.
+Each service publishes its calls through its `_client` package, which is the only code that knows the encoding. A service's API is the schema plus the client, written up in `design/$service/API.md`. The map of every connection, the frame layout, and who may call what are in [network](common/NETWORK.md).
 
 ### Security is optional, and pluggable
 
